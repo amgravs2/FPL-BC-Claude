@@ -611,3 +611,70 @@ def sync_lineups(season_id: int, gw: int) -> dict:
         conn.commit()
 
     return {"lineup_picks": len(records), "teams_skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# standings
+# Rebuilt from fantasy_matches on each sync.
+# One row per team per GW — stores opponent, result, and cumulative points.
+# ---------------------------------------------------------------------------
+
+def sync_standings(season_id: int) -> dict:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # Pull all finished matches for the season
+            cur.execute("""
+                SELECT gw, entry_1, entry_2, entry_1_points, entry_2_points
+                FROM fantasy_matches
+                WHERE season_id = %s AND finished = TRUE
+                ORDER BY gw ASC;
+            """, (season_id,))
+            matches = cur.fetchall()
+
+        if not matches:
+            return {"standings_rows": 0}
+
+        # Build per-GW rows for each team
+        gw_rows = []  # (season_id, gw, team_id, opponent_id, pts_for, pts_against, result, league_pts)
+        for gw, e1, e2, p1, p2 in matches:
+            if p1 > p2:
+                r1, r2, lp1, lp2 = 'w', 'l', 3, 0
+            elif p2 > p1:
+                r1, r2, lp1, lp2 = 'l', 'w', 0, 3
+            else:
+                r1, r2, lp1, lp2 = 'd', 'd', 1, 1
+
+            gw_rows.append((season_id, gw, e1, e2, p1, p2, r1, lp1))
+            gw_rows.append((season_id, gw, e2, e1, p2, p1, r2, lp2))
+
+        # Calculate cumulative points per team up to each GW
+        # Accumulate in order since matches are already sorted by gw
+        cumulative: dict[int, int] = {}  # team_id -> running total
+        records = []
+        for season_id_, gw, team_id, opponent_id, pts_for, pts_against, result, league_pts in gw_rows:
+            cumulative[team_id] = cumulative.get(team_id, 0) + league_pts
+            records.append((
+                season_id_, gw, team_id, opponent_id,
+                pts_for, pts_against, result, league_pts,
+                cumulative[team_id],
+            ))
+
+        # Upsert — full rebuild so cumulative totals are always correct
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO standings (
+                    season_id, gw, team_id, opponent_id,
+                    points_for, points_against, result, league_points, cumulative_points
+                ) VALUES %s
+                ON CONFLICT (season_id, gw, team_id) DO UPDATE SET
+                    opponent_id       = EXCLUDED.opponent_id,
+                    points_for        = EXCLUDED.points_for,
+                    points_against    = EXCLUDED.points_against,
+                    result            = EXCLUDED.result,
+                    league_points     = EXCLUDED.league_points,
+                    cumulative_points = EXCLUDED.cumulative_points;
+            """, records)
+            conn.commit()
+
+    return {"standings_rows": len(records)}
