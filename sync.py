@@ -14,6 +14,7 @@ from fpl_client import (
     fetch_gw_live,
     fetch_entry_picks,
     fetch_fixtures,
+    fetch_draft_choices,
 )
 
 logger = logging.getLogger(__name__)
@@ -678,3 +679,41 @@ def sync_standings(season_id: int) -> dict:
             conn.commit()
 
     return {"standings_rows": len(records)}
+
+
+# ---------------------------------------------------------------------------
+# draft_picks
+# ---------------------------------------------------------------------------
+
+def sync_draft_picks(season_id: int) -> dict:
+    league_id = get_season_league_id(season_id)
+    data      = fetch_draft_choices(league_id)
+    choices   = data.get("choices", [])
+
+    records = [
+        (
+            c["id"], season_id,
+            c.get("draft"),
+            c.get("entry"),
+            c.get("element"),
+            c.get("round"),
+            c.get("pick"),
+            c.get("index"),
+            c.get("was_auto", False),
+            c.get("choice_time"),
+        )
+        for c in choices
+    ]
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO draft_picks (
+                    id, season_id, draft_id, entry_id, player_id,
+                    round, pick, overall_pick, was_auto, choice_time
+                ) VALUES %s
+                ON CONFLICT (id) DO NOTHING;
+            """, records)
+        conn.commit()
+
+    return {"draft_picks": len(records)}
