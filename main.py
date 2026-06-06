@@ -13,6 +13,7 @@ from sync import (
     sync_gw_stats,
     sync_lineups,
     sync_standings,
+    sync_draft_picks,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -160,4 +161,12 @@ def route_sync_standings(season_id: int | None = Query(default=None)):
     """
     sid = _resolve_season(season_id)
     result = sync_standings(sid)
+    return {"season_id": sid, "synced": result}
+
+
+@app.post("/sync/draft-picks", tags=["sync"])
+def route_sync_draft_picks(season_id: int | None = Query(default=None)):
+    """Syncs draft pick order for the season."""
+    sid = _resolve_season(season_id)
+    result = sync_draft_picks(sid)
     return {"season_id": sid, "synced": result}
