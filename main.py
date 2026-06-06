@@ -12,6 +12,7 @@ from sync import (
     sync_fixtures,
     sync_gw_stats,
     sync_lineups,
+    sync_standings,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -149,3 +150,14 @@ def route_sync_all(season_id: int | None = Query(default=None)):
     results["transactions"]   = sync_transactions(sid)
     results["fixtures"]       = sync_fixtures(sid)
     return {"season_id": sid, "synced": results}
+
+
+@app.post("/sync/standings", tags=["sync"])
+def route_sync_standings(season_id: int | None = Query(default=None)):
+    """
+    Rebuilds standings from fantasy_matches.
+    Run after /sync/matches. Calculates W/D/L, league points, and cumulative totals.
+    """
+    sid = _resolve_season(season_id)
+    result = sync_standings(sid)
+    return {"season_id": sid, "synced": result}
