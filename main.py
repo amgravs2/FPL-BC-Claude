@@ -1,8 +1,10 @@
 import logging
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Query
 from contextlib import asynccontextmanager
 
 from db import get_active_season_id
+from queries import router as query_router
 from sync import (
     sync_bootstrap,
     sync_fantasy_teams,
@@ -28,6 +30,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="FPL Draft Backend", lifespan=lifespan)
+app.include_router(query_router)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
