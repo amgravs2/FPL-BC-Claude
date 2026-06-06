@@ -2,8 +2,8 @@ import logging
 from fastapi import FastAPI, HTTPException, Query
 from contextlib import asynccontextmanager
 
-from .db import get_active_season_id
-from .sync import (
+from db import get_active_season_id
+from sync import (
     sync_bootstrap,
     sync_fantasy_teams,
     sync_fantasy_matches,
