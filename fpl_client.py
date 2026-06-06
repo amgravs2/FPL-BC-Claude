@@ -52,3 +52,8 @@ def fetch_entry_picks(entry_id: int, gw: int) -> dict:
 def fetch_fixtures() -> list:
     """All PL fixtures for the season (from main FPL API)."""
     return _get(f"{FPL_BASE}/fixtures")
+
+
+def fetch_draft_choices(league_id: int) -> dict:
+    """Draft pick order for the league."""
+    return _get(f"{DRAFT_BASE}/draft/{league_id}/choices")
