@@ -349,28 +349,31 @@ def sync_fantasy_matches(season_id: int) -> dict:
     data      = fetch_league_details(league_id)
     matches   = data.get("matches", [])
 
+    # API uses league_entry_1/2, no id field — PK is (season_id, gw, entry_1, entry_2)
     records = [
         (
-            m["id"], season_id,
+            season_id,
             m.get("event"),
-            m.get("entry_1"), m.get("entry_2"),
-            m.get("entry_1_points"), m.get("entry_2_points"),
+            m.get("league_entry_1"), m.get("league_entry_2"),
+            m.get("league_entry_1_points"), m.get("league_entry_2_points"),
+            m.get("finished", False), m.get("started", False),
         )
         for m in matches
+        if m.get("event") is not None
     ]
 
     with get_conn() as conn:
         with conn.cursor() as cur:
             execute_values(cur, """
                 INSERT INTO fantasy_matches (
-                    id, season_id, gw, entry_1, entry_2, entry_1_points, entry_2_points
+                    season_id, gw, entry_1, entry_2,
+                    entry_1_points, entry_2_points, finished, started
                 ) VALUES %s
-                ON CONFLICT (id, season_id) DO UPDATE SET
-                    gw             = EXCLUDED.gw,
-                    entry_1        = EXCLUDED.entry_1,
-                    entry_2        = EXCLUDED.entry_2,
+                ON CONFLICT (season_id, gw, entry_1, entry_2) DO UPDATE SET
                     entry_1_points = EXCLUDED.entry_1_points,
-                    entry_2_points = EXCLUDED.entry_2_points;
+                    entry_2_points = EXCLUDED.entry_2_points,
+                    finished       = EXCLUDED.finished,
+                    started        = EXCLUDED.started;
             """, records)
         conn.commit()
 
