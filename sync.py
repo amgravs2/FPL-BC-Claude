@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 
 from psycopg2.extras import execute_values
 
-from .db import get_conn, get_season_league_id
-from .fpl_client import (
+from db import get_conn, get_season_league_id
+from fpl_client import (
     fetch_bootstrap,
     fetch_game_state,
     fetch_league_details,
