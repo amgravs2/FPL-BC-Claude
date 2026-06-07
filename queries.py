@@ -449,7 +449,12 @@ def get_manager_profile(season_id: int, team_id: int):
                     SUM(pgs.goals_conceded) AS goals_conceded,
                     SUM(pgs.own_goals)     AS own_goals,
                     SUM(pgs.penalties_saved) AS penalties_saved,
-                    SUM(pgs.penalties_missed) AS penalties_missed
+                    SUM(pgs.penalties_missed) AS penalties_missed,
+                    SUM(pgs.tackles)       AS tackles,
+                    SUM(pgs.recoveries)    AS recoveries,
+                    SUM(pgs.clearances_blocks_interceptions) AS cbi,
+                    SUM(pgs.defensive_contribution) AS defensive_contribution,
+                    SUM(pgs.bps)           AS bps
                 FROM gameweek_lineups gl
                 JOIN player_gameweek_stats pgs
                     ON pgs.player_id = gl.player_id
@@ -537,6 +542,11 @@ def get_manager_profile(season_id: int, team_id: int):
                 "own_goals":        r[11],
                 "penalties_saved":  r[12],
                 "penalties_missed": r[13],
+                "tackles":          r[14],
+                "recoveries":       r[15],
+                "cbi":              r[16],
+                "defensive_contribution": r[17],
+                "bps":              r[18],
             }
             for r in by_position
         ],
@@ -627,14 +637,59 @@ def get_draft_scorecard(season_id: int):
     # Expected: earlier picks should score more. Compare actual vs peer picks.
     value = sorted(picks, key=lambda x: x["season_points"], reverse=True)[:5]
     busts = sorted(
-        [p for p in picks if p["overall_pick"] <= 36],  # top 6 rounds only
+        [p for p in picks if p["overall_pick"] <= 36],
         key=lambda x: x["season_points"]
     )[:5]
 
+    # Median points per round
+    import statistics
+    round_stats = {}
+    for p in picks:
+        r = p["round"]
+        if r not in round_stats:
+            round_stats[r] = []
+        round_stats[r].append(p["season_points"])
+
+    round_medians = [
+        {
+            "round":  r,
+            "median": round(statistics.median(pts), 1),
+            "mean":   round(statistics.mean(pts), 1),
+            "min":    min(pts),
+            "max":    max(pts),
+        }
+        for r, pts in sorted(round_stats.items())
+    ]
+
+    # Position composition per manager
+    composition = {}
+    for p in picks:
+        tid = p["team_id"]
+        mgr = p["manager"]
+        if tid not in composition:
+            composition[tid] = {"manager": mgr, "team_id": tid, "GKP": 0, "DEF": 0, "MID": 0, "FWD": 0, "total_points": 0}
+        composition[tid][p["position"]] = composition[tid].get(p["position"], 0) + 1
+        composition[tid]["total_points"] += p["season_points"]
+
+    # Value score: season_points relative to pick position expectation
+    # Simple: compare each pick to the median for its round
+    median_by_round = {r["round"]: r["median"] for r in round_medians}
+    for p in picks:
+        expected = median_by_round.get(p["round"], 0)
+        p["value_score"] = round(p["season_points"] - expected, 1)
+
+    value_by_score = sorted(picks, key=lambda x: x["value_score"], reverse=True)[:5]
+    busts_by_score = sorted(
+        [p for p in picks if p["overall_pick"] <= 36],
+        key=lambda x: x["value_score"]
+    )[:5]
+
     return {
-        "picks":       picks,
-        "value_picks": value,
-        "busts":       busts,
+        "picks":           picks,
+        "value_picks":     value_by_score,
+        "busts":           busts_by_score,
+        "round_medians":   round_medians,
+        "composition":     list(composition.values()),
     }
 
 
@@ -665,6 +720,7 @@ def get_player_stats(season_id: int):
                     COALESCE(SUM(pgs.yellow_cards), 0)   AS yellow_cards,
                     COALESCE(SUM(pgs.red_cards), 0)      AS red_cards,
                     COALESCE(SUM(pgs.goals_conceded), 0) AS goals_conceded,
+                    COUNT(CASE WHEN pgs.minutes = 0 THEN 1 END) AS blank_gws,
                     ft.player_first_name                  AS owner,
                     ft.internal_team_id                   AS owner_team_id
                 FROM players p
@@ -703,8 +759,9 @@ def get_player_stats(season_id: int):
             "yellow_cards":  r[12],
             "red_cards":     r[13],
             "goals_conceded": r[14],
-            "owner":         r[15],
-            "owner_team_id": r[16],
+            "blank_gws":     r[15],
+            "owner":         r[16],
+            "owner_team_id": r[17],
         }
         for r in rows
     ]
@@ -950,4 +1007,153 @@ def get_alltime_records():
             }
             for r in finishes
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GW lineup for a specific team + gameweek (for expandable results)
+# ---------------------------------------------------------------------------
+
+@router.get("/season/{season_id}/lineup/{team_id}/{gw}")
+def get_gw_lineup(season_id: int, team_id: int, gw: int):
+    """Returns starters and bench for a team in a specific GW with points."""
+    _season_or_404(season_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    gl.position,
+                    gl.is_captain,
+                    gl.is_vice_captain,
+                    gl.multiplier,
+                    p.first_name || ' ' || p.second_name AS player_name,
+                    p.web_name,
+                    p.id AS player_id,
+                    et.singular_name_short AS pos,
+                    COALESCE(pgs.total_points, 0) AS points,
+                    COALESCE(pgs.minutes, 0)       AS minutes,
+                    COALESCE(pgs.goals, 0)         AS goals,
+                    COALESCE(pgs.assists, 0)       AS assists,
+                    COALESCE(pgs.bonus, 0)         AS bonus
+                FROM gameweek_lineups gl
+                JOIN players p ON p.id = gl.player_id
+                JOIN element_type et ON et.id = p.position
+                LEFT JOIN player_gameweek_stats pgs
+                    ON pgs.player_id = gl.player_id
+                    AND pgs.season_id = gl.season_id
+                    AND pgs.gw = gl.gw
+                WHERE gl.season_id = %s
+                    AND gl.team_id = %s
+                    AND gl.gw = %s
+                ORDER BY gl.position;
+            """, (season_id, team_id, gw))
+            rows = cur.fetchall()
+
+    picks = [
+        {
+            "position":        r[0],
+            "is_captain":      r[1],
+            "is_vice_captain": r[2],
+            "multiplier":      r[3],
+            "player_name":     r[4],
+            "web_name":        r[5],
+            "player_id":       r[6],
+            "pos":             r[7],
+            "points":          r[8],
+            "minutes":         r[9],
+            "goals":           r[10],
+            "assists":         r[11],
+            "bonus":           r[12],
+        }
+        for r in rows
+    ]
+
+    return {
+        "starters": [p for p in picks if p["position"] <= 11],
+        "bench":    [p for p in picks if p["position"] > 11],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fixtures upcoming — for fixture difficulty grid
+# ---------------------------------------------------------------------------
+
+@router.get("/season/{season_id}/fixtures-upcoming")
+def get_fixtures_upcoming(season_id: int):
+    """Returns upcoming fixtures with team strength data for FDR grid."""
+    _season_or_404(season_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Get current GW
+            cur.execute("""
+                SELECT COALESCE(MAX(gw), 1) FROM player_gameweek_stats
+                WHERE season_id = %s;
+            """, (season_id,))
+            current_gw = cur.fetchone()[0]
+
+            # Get upcoming fixtures
+            cur.execute("""
+                SELECT f.gw, f.team_h, f.team_a, f.kickoff_time,
+                       th.strength_overall_home, th.strength_overall_away,
+                       ta.strength_overall_home AS a_str_home,
+                       ta.strength_overall_away AS a_str_away
+                FROM fixtures f
+                JOIN premier_league_teams th ON th.id = f.team_h AND th.season_id = f.season_id
+                JOIN premier_league_teams ta ON ta.id = f.team_a AND ta.season_id = f.season_id
+                WHERE f.season_id = %s AND f.gw >= %s AND f.gw <= %s
+                ORDER BY f.gw, f.kickoff_time;
+            """, (season_id, current_gw, current_gw + 6))
+            fixture_rows = cur.fetchall()
+
+            # Get all teams
+            cur.execute("""
+                SELECT id, name, short_name,
+                       strength_overall_home, strength_overall_away,
+                       strength_attack_home, strength_attack_away,
+                       strength_defence_home, strength_defence_away
+                FROM premier_league_teams WHERE season_id = %s;
+            """, (season_id,))
+            team_rows = cur.fetchall()
+
+    teams = [
+        {
+            "id": r[0], "name": r[1], "short_name": r[2],
+            "strength_overall_home": r[3], "strength_overall_away": r[4],
+            "strength_attack_home": r[5], "strength_attack_away": r[6],
+            "strength_defence_home": r[7], "strength_defence_away": r[8],
+        }
+        for r in team_rows
+    ]
+
+    # Calculate FDR (1-5) based on opponent strength relative to average
+    strength_vals = [t["strength_overall_home"] for t in teams if t["strength_overall_home"]]
+    avg_strength  = sum(strength_vals) / len(strength_vals) if strength_vals else 1200
+    strength_map  = {t["id"]: t for t in teams}
+
+    def fdr(opponent_id, home):
+        opp = strength_map.get(opponent_id, {})
+        opp_str = opp.get("strength_overall_away" if home else "strength_overall_home", avg_strength)
+        if opp_str <= 0: return 3
+        ratio = opp_str / avg_strength
+        if ratio < 0.85:  return 2
+        if ratio < 1.0:   return 3
+        if ratio < 1.15:  return 4
+        return 5
+
+    fixtures = [
+        {
+            "gw":               r[0],
+            "team_h":           r[1],
+            "team_a":           r[2],
+            "kickoff_time":     str(r[3]) if r[3] else None,
+            "team_h_difficulty": fdr(r[2], True),
+            "team_a_difficulty": fdr(r[1], False),
+        }
+        for r in fixture_rows
+    ]
+
+    return {
+        "current_gw": current_gw,
+        "teams":      teams,
+        "fixtures":   fixtures,
     }
