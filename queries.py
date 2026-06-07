@@ -585,7 +585,7 @@ def get_player_stats(season_id: int):
                     et.singular_name_short AS position,
                     plt.short_name         AS pl_team,
                     COALESCE(SUM(pgs.total_points), 0)   AS total_points,
-                    COALESCE(SUM(pgs.goals_scored), 0)   AS goals,
+                    COALESCE(SUM(pgs.goals), 0)           AS goals,
                     COALESCE(SUM(pgs.assists), 0)        AS assists,
                     COALESCE(SUM(pgs.clean_sheets), 0)   AS clean_sheets,
                     COALESCE(SUM(pgs.bonus), 0)          AS bonus,
