@@ -15,12 +15,25 @@ def get_conn():
 
 
 def get_active_season_id() -> int | None:
-    """Return the season whose date range contains today."""
+    """
+    Return the active season (today falls within its dates).
+    Falls back to the most recent season if none is currently active —
+    handles the off-season gap between seasons.
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id FROM seasons
                 WHERE CURRENT_DATE BETWEEN start_date AND end_date
+                LIMIT 1;
+            """)
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            # Off-season: return the most recently ended season
+            cur.execute("""
+                SELECT id FROM seasons
+                ORDER BY end_date DESC
                 LIMIT 1;
             """)
             row = cur.fetchone()
