@@ -287,6 +287,65 @@ def get_season_records(season_id: int):
             """, (season_id,))
             unlucky = cur.fetchone()
 
+            # Closest match
+            cur.execute("""
+                SELECT
+                    t1.player_first_name AS winner,
+                    t2.player_first_name AS loser,
+                    s.gw, s.points_for, s.points_against,
+                    ABS(s.points_for - s.points_against) AS margin
+                FROM standings s
+                JOIN fantasy_teams t1 ON t1.internal_team_id = s.team_id
+                    AND t1.season_id = s.season_id
+                JOIN fantasy_teams t2 ON t2.internal_team_id = s.opponent_id
+                    AND t2.season_id = s.season_id
+                WHERE s.season_id = %s AND s.result != 'd'
+                ORDER BY margin ASC, s.gw ASC LIMIT 1;
+            """, (season_id,))
+            closest = cur.fetchone()
+
+            # Longest win streak
+            cur.execute("""
+                WITH ordered AS (
+                    SELECT team_id, gw, result,
+                           ROW_NUMBER() OVER (PARTITION BY team_id ORDER BY gw) -
+                           ROW_NUMBER() OVER (PARTITION BY team_id, result ORDER BY gw) AS grp
+                    FROM standings WHERE season_id = %s
+                ),
+                streaks AS (
+                    SELECT team_id, result, COUNT(*) AS streak_len, MIN(gw) AS start_gw, MAX(gw) AS end_gw
+                    FROM ordered WHERE result = 'w'
+                    GROUP BY team_id, result, grp
+                )
+                SELECT ft.player_first_name, s.streak_len, s.start_gw, s.end_gw
+                FROM streaks s
+                JOIN fantasy_teams ft ON ft.internal_team_id = s.team_id
+                    AND ft.season_id = %s
+                ORDER BY s.streak_len DESC LIMIT 1;
+            """, (season_id, season_id))
+            win_streak = cur.fetchone()
+
+            # Longest losing streak
+            cur.execute("""
+                WITH ordered AS (
+                    SELECT team_id, gw, result,
+                           ROW_NUMBER() OVER (PARTITION BY team_id ORDER BY gw) -
+                           ROW_NUMBER() OVER (PARTITION BY team_id, result ORDER BY gw) AS grp
+                    FROM standings WHERE season_id = %s
+                ),
+                streaks AS (
+                    SELECT team_id, result, COUNT(*) AS streak_len, MIN(gw) AS start_gw, MAX(gw) AS end_gw
+                    FROM ordered WHERE result = 'l'
+                    GROUP BY team_id, result, grp
+                )
+                SELECT ft.player_first_name, s.streak_len, s.start_gw, s.end_gw
+                FROM streaks s
+                JOIN fantasy_teams ft ON ft.internal_team_id = s.team_id
+                    AND ft.season_id = %s
+                ORDER BY s.streak_len DESC LIMIT 1;
+            """, (season_id, season_id))
+            loss_streak = cur.fetchone()
+
             # Bench points per manager (from gameweek_lineups + player_gameweek_stats)
             cur.execute("""
                 SELECT
@@ -323,6 +382,18 @@ def get_season_records(season_id: int):
             "manager": unlucky[0], "gw": unlucky[1],
             "points_for": unlucky[2], "points_against": unlucky[3]
         } if unlucky else None,
+        "closest_match": {
+            "winner": closest[0], "loser": closest[1], "gw": closest[2],
+            "winner_points": closest[3], "loser_points": closest[4], "margin": closest[5]
+        } if closest else None,
+        "longest_win_streak": {
+            "manager": win_streak[0], "length": win_streak[1],
+            "start_gw": win_streak[2], "end_gw": win_streak[3]
+        } if win_streak else None,
+        "longest_loss_streak": {
+            "manager": loss_streak[0], "length": loss_streak[1],
+            "start_gw": loss_streak[2], "end_gw": loss_streak[3]
+        } if loss_streak else None,
         "bench_points": [
             {"manager": r[0], "bench_points": r[1]} for r in bench
         ],
