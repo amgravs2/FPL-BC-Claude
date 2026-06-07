@@ -523,6 +523,12 @@ def sync_gw_stats(season_id: int, gw: int) -> dict:
             _float(s.get("creativity")),
             _float(s.get("threat")),
             _float(s.get("ict_index")),
+            _int(s.get("bps")),
+            _int(s.get("starts")),
+            _int(s.get("clearances_blocks_interceptions")),
+            _int(s.get("recoveries")),
+            _int(s.get("tackles")),
+            _int(s.get("defensive_contribution")),
         ))
 
     with get_conn() as conn:
@@ -534,7 +540,9 @@ def sync_gw_stats(season_id: int, gw: int) -> dict:
                     yellow_cards, red_cards, total_points, minutes, goals_conceded,
                     penalties_saved, penalties_missed, own_goals,
                     expected_goals, expected_assists, expected_goal_involvement,
-                    expected_goals_conceded, influence, creativity, threat, ict_index
+                    expected_goals_conceded, influence, creativity, threat, ict_index,
+                    bps, starts, clearances_blocks_interceptions, recoveries, tackles,
+                    defensive_contribution
                 ) VALUES %s
                 ON CONFLICT (player_id, season_id, gw) DO UPDATE SET
                     goals              = EXCLUDED.goals,
@@ -557,7 +565,13 @@ def sync_gw_stats(season_id: int, gw: int) -> dict:
                     influence          = EXCLUDED.influence,
                     creativity         = EXCLUDED.creativity,
                     threat             = EXCLUDED.threat,
-                    ict_index          = EXCLUDED.ict_index;
+                    ict_index          = EXCLUDED.ict_index,
+                    bps                = EXCLUDED.bps,
+                    starts             = EXCLUDED.starts,
+                    clearances_blocks_interceptions = EXCLUDED.clearances_blocks_interceptions,
+                    recoveries         = EXCLUDED.recoveries,
+                    tackles            = EXCLUDED.tackles,
+                    defensive_contribution = EXCLUDED.defensive_contribution;
             """, records)
         conn.commit()
 
