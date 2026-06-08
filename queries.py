@@ -1080,81 +1080,89 @@ def get_gw_lineup(season_id: int, team_id: int, gw: int):
 
 # ---------------------------------------------------------------------------
 # Fixtures upcoming — for fixture difficulty grid
+# Uses FPL main bootstrap for attack/defence split FDR
 # ---------------------------------------------------------------------------
 
 @router.get("/season/{season_id}/fixtures-upcoming")
 def get_fixtures_upcoming(season_id: int):
-    """Returns upcoming fixtures with team strength data for FDR grid."""
+    """Returns upcoming fixtures with attack/defence FDR from FPL main bootstrap."""
+    from fpl_client import fetch_fpl_bootstrap, fetch_fixtures
     _season_or_404(season_id)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Get current GW
             cur.execute("""
                 SELECT COALESCE(MAX(gw), 1) FROM player_gameweek_stats
                 WHERE season_id = %s;
             """, (season_id,))
             current_gw = cur.fetchone()[0]
 
-            # Get upcoming fixtures
             cur.execute("""
-                SELECT f.gw, f.team_h, f.team_a, f.kickoff_time,
-                       th.strength_overall_home, th.strength_overall_away,
-                       ta.strength_overall_home AS a_str_home,
-                       ta.strength_overall_away AS a_str_away
+                SELECT f.gw, f.team_h, f.team_a, f.kickoff_time
                 FROM fixtures f
-                JOIN premier_league_teams th ON th.id = f.team_h AND th.season_id = f.season_id
-                JOIN premier_league_teams ta ON ta.id = f.team_a AND ta.season_id = f.season_id
                 WHERE f.season_id = %s AND f.gw >= %s AND f.gw <= %s
                 ORDER BY f.gw, f.kickoff_time;
             """, (season_id, current_gw, current_gw + 6))
             fixture_rows = cur.fetchall()
 
-            # Get all teams
-            cur.execute("""
-                SELECT id, name, short_name,
-                       strength_overall_home, strength_overall_away,
-                       strength_attack_home, strength_attack_away,
-                       strength_defence_home, strength_defence_away
-                FROM premier_league_teams WHERE season_id = %s;
-            """, (season_id,))
-            team_rows = cur.fetchall()
+    # Pull live team strength data from FPL main bootstrap
+    try:
+        bootstrap  = fetch_fpl_bootstrap()
+        fpl_teams  = bootstrap.get("teams", [])
+    except Exception:
+        fpl_teams  = []
 
     teams = [
         {
-            "id": r[0], "name": r[1], "short_name": r[2],
-            "strength_overall_home": r[3], "strength_overall_away": r[4],
-            "strength_attack_home": r[5], "strength_attack_away": r[6],
-            "strength_defence_home": r[7], "strength_defence_away": r[8],
+            "id":                    t["id"],
+            "name":                  t["name"],
+            "short_name":            t["short_name"],
+            "strength_overall_home": t.get("strength_overall_home", 1200),
+            "strength_overall_away": t.get("strength_overall_away", 1200),
+            "strength_attack_home":  t.get("strength_attack_home", 1200),
+            "strength_attack_away":  t.get("strength_attack_away", 1200),
+            "strength_defence_home": t.get("strength_defence_home", 1200),
+            "strength_defence_away": t.get("strength_defence_away", 1200),
         }
-        for r in team_rows
+        for t in fpl_teams
     ]
 
-    # Calculate FDR (1-5) based on opponent strength relative to average
-    strength_vals = [t["strength_overall_home"] for t in teams if t["strength_overall_home"]]
-    avg_strength  = sum(strength_vals) / len(strength_vals) if strength_vals else 1200
-    strength_map  = {t["id"]: t for t in teams}
+    strength_map = {t["id"]: t for t in teams}
 
-    def fdr(opponent_id, home):
-        opp = strength_map.get(opponent_id, {})
-        opp_str = opp.get("strength_overall_away" if home else "strength_overall_home", avg_strength)
-        if opp_str <= 0: return 3
-        ratio = opp_str / avg_strength
-        if ratio < 0.85:  return 2
-        if ratio < 1.0:   return 3
-        if ratio < 1.15:  return 4
+    def _fdr(strength_val, all_vals):
+        """Convert raw strength to 1-5 FDR scale."""
+        if not all_vals or not strength_val: return 3
+        avg = sum(all_vals) / len(all_vals)
+        ratio = strength_val / avg
+        if ratio < 0.87: return 2
+        if ratio < 0.97: return 3
+        if ratio < 1.07: return 3
+        if ratio < 1.17: return 4
         return 5
 
-    fixtures = [
-        {
-            "gw":               r[0],
-            "team_h":           r[1],
-            "team_a":           r[2],
-            "kickoff_time":     str(r[3]) if r[3] else None,
-            "team_h_difficulty": fdr(r[2], True),
-            "team_a_difficulty": fdr(r[1], False),
-        }
-        for r in fixture_rows
-    ]
+    all_atk  = [t["strength_attack_away"]  for t in teams if t["strength_attack_away"]]
+    all_def  = [t["strength_defence_away"] for t in teams if t["strength_defence_away"]]
+    all_atk_h = [t["strength_attack_home"]  for t in teams if t["strength_attack_home"]]
+    all_def_h = [t["strength_defence_home"] for t in teams if t["strength_defence_home"]]
+
+    fixtures = []
+    for r in fixture_rows:
+        gw, team_h_id, team_a_id, kickoff = r
+        opp_h = strength_map.get(team_a_id, {})  # home team faces away opponent
+        opp_a = strength_map.get(team_h_id, {})  # away team faces home opponent
+
+        fixtures.append({
+            "gw":           gw,
+            "team_h":       team_h_id,
+            "team_a":       team_a_id,
+            "kickoff_time": str(kickoff) if kickoff else None,
+            # Home team FDR — how hard is the away opponent's attack/defence?
+            "team_h_attack_fdr":  _fdr(opp_h.get("strength_attack_away"), all_atk),
+            "team_h_defence_fdr": _fdr(opp_h.get("strength_defence_away"), all_def),
+            # Away team FDR
+            "team_a_attack_fdr":  _fdr(opp_a.get("strength_attack_home"), all_atk_h),
+            "team_a_defence_fdr": _fdr(opp_a.get("strength_defence_home"), all_def_h),
+        })
 
     return {
         "current_gw": current_gw,
