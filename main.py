@@ -17,6 +17,8 @@ from sync import (
     sync_standings,
     sync_draft_picks,
     sync_element_summaries,
+    sync_pl_team_records,       # NEW
+    sync_ownership_from_draft,  # NEW
 )
 
 logging.basicConfig(level=logging.INFO)
