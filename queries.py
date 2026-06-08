@@ -966,19 +966,20 @@ def get_player_gw_stats(season_id: int, player_id: int):
             cur.execute("""
                 SELECT
                     pfh.gw,
-                    SUM(pfh.total_points)   AS total_points,
-                    SUM(pfh.goals_scored)   AS goals,
-                    SUM(pfh.assists)        AS assists,
-                    SUM(pfh.clean_sheets)   AS clean_sheets,
-                    SUM(pfh.bonus)          AS bonus,
-                    SUM(pfh.saves)          AS saves,
-                    SUM(pfh.minutes)        AS minutes,
-                    SUM(pfh.yellow_cards)   AS yellow_cards,
-                    SUM(pfh.red_cards)      AS red_cards,
-                    SUM(pfh.goals_conceded) AS goals_conceded,
-                    SUM(pfh.bps)            AS bps,
-                    MIN(pfh.opponent_team)  AS opponent_team_id,
-                    MIN(plt.short_name)     AS opponent_short
+                    SUM(pfh.total_points)              AS total_points,
+                    SUM(pfh.goals_scored)              AS goals,
+                    SUM(pfh.assists)                   AS assists,
+                    SUM(pfh.clean_sheets)              AS clean_sheets,
+                    SUM(pfh.bonus)                     AS bonus,
+                    SUM(pfh.saves)                     AS saves,
+                    SUM(pfh.minutes)                   AS minutes,
+                    SUM(pfh.yellow_cards)              AS yellow_cards,
+                    SUM(pfh.red_cards)                 AS red_cards,
+                    SUM(pfh.goals_conceded)            AS goals_conceded,
+                    SUM(pfh.bps)                       AS bps,
+                    COALESCE(SUM(pfh.defensive_contribution), 0) AS defensive_contribution,
+                    MIN(pfh.opponent_team)             AS opponent_team_id,
+                    MIN(plt.short_name)                AS opponent_short
                 FROM player_fixture_history pfh
                 LEFT JOIN premier_league_teams plt
                     ON plt.id = pfh.opponent_team
@@ -1002,14 +1003,14 @@ def get_player_gw_stats(season_id: int, player_id: int):
             "yellow_cards":           r[8],
             "red_cards":              r[9],
             "goals_conceded":         r[10],
-            "defensive_contribution": 0,
+            "defensive_contribution": r[12],
             "expected_goals":         0,
             "expected_assists":       0,
             "bps":                    r[11],
             "owner_this_gw":          None,
             "owner_team_id_this_gw":  None,
-            "opponent_team_id":        r[12],
-            "opponent_short":          r[13],
+            "opponent_team_id":        r[13],
+            "opponent_short":          r[14],
         }
         for r in fallback_rows
     ]
