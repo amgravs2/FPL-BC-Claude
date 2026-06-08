@@ -1126,21 +1126,35 @@ def get_player_ownership(season_id: int, player_id: int):
     ]
 
 
-# ---------------------------------------------------------------------------
-# Transfer analytics
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSFER ANALYTICS  (replace the existing get_transfer_analytics function
+# and add get_transfer_stats below it in queries.py)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/season/{season_id}/transfers")
 def get_transfer_analytics(season_id: int):
-    """Transfer activity per manager with post-transfer point delta."""
+    """
+    Transfer activity per manager with post-transfer point delta.
+
+    Now includes:
+      - position (singular_name_short) and pl_team short_name for BOTH players
+      - Player injury snapshot at the time we serve the data:
+          status, news, chance_of_playing_next_round, chance_of_playing_this_round
+        (stored in players table which is updated on every sync)
+      - per_gw_points: dict mapping GW → {in: pts, out: pts} from the transfer
+        GW onwards, so the frontend can draw the head-to-head chart.
+    """
     _season_or_404(season_id)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # ── 1. Core transfer rows with position + team enrichment ──────────
             cur.execute("""
                 WITH transfer_deltas AS (
                     SELECT
                         tx.id,
-                        ft.player_first_name AS manager,
+                        ft.player_first_name                         AS manager,
+                        ft.id                                        AS fantasy_team_id,
                         ft.internal_team_id,
                         tx.gw,
                         tx.kind,
@@ -1149,6 +1163,22 @@ def get_transfer_analytics(season_id: int):
                         p_out.first_name || ' ' || p_out.second_name AS player_out,
                         tx.player_in_id,
                         tx.player_out_id,
+                        -- Position (element_type)
+                        et_in.singular_name_short                    AS pos_in,
+                        et_out.singular_name_short                   AS pos_out,
+                        -- PL team short name
+                        plt_in.short_name                            AS team_in,
+                        plt_out.short_name                           AS team_out,
+                        -- Injury / availability snapshot (current state in players table)
+                        p_in.status                                  AS status_in,
+                        p_in.news                                    AS news_in,
+                        p_in.chance_of_playing_next_round            AS cop_next_in,
+                        p_in.chance_of_playing_this_round            AS cop_this_in,
+                        p_out.status                                 AS status_out,
+                        p_out.news                                   AS news_out,
+                        p_out.chance_of_playing_next_round           AS cop_next_out,
+                        p_out.chance_of_playing_this_round           AS cop_this_out,
+                        -- Points after transfer
                         COALESCE((
                             SELECT SUM(pgs.total_points)
                             FROM player_gameweek_stats pgs
@@ -1169,41 +1199,97 @@ def get_transfer_analytics(season_id: int):
                         AND ft.season_id = tx.season_id
                     JOIN players p_in  ON p_in.id  = tx.player_in_id
                     JOIN players p_out ON p_out.id = tx.player_out_id
+                    -- Position lookups
+                    JOIN element_type et_in  ON et_in.id  = p_in.position
+                    JOIN element_type et_out ON et_out.id = p_out.position
+                    -- PL team lookups
+                    JOIN premier_league_teams plt_in
+                        ON plt_in.id = p_in.team AND plt_in.season_id = tx.season_id
+                    JOIN premier_league_teams plt_out
+                        ON plt_out.id = p_out.team AND plt_out.season_id = tx.season_id
                     WHERE tx.season_id = %s AND tx.result = 'a'
                 )
                 SELECT *,
                     (points_in_after - points_out_after) AS delta
                 FROM transfer_deltas
-                ORDER BY delta DESC;
+                ORDER BY gw DESC, id DESC;
             """, (season_id,))
             rows = cur.fetchall()
 
-    transfers = [
-        {
-            "id":               r[0],
-            "manager":          r[1],
-            "team_id":          r[2],
-            "gw":               r[3],
-            "kind":             r[4],
-            "result":           r[5],
-            "player_in":        r[6],
-            "player_out":       r[7],
-            "player_in_id":     r[8],
-            "player_out_id":    r[9],
-            "points_in_after":  r[10],
-            "points_out_after": r[11],
-            "delta":            r[12],
-        }
-        for r in rows
-    ]
+            col_names = [
+                "id", "manager", "fantasy_team_id", "internal_team_id",
+                "gw", "kind", "result",
+                "player_in", "player_out",
+                "player_in_id", "player_out_id",
+                "pos_in", "pos_out",
+                "team_in", "team_out",
+                "status_in", "news_in", "cop_next_in", "cop_this_in",
+                "status_out", "news_out", "cop_next_out", "cop_this_out",
+                "points_in_after", "points_out_after", "delta",
+            ]
+            transfers_raw = [dict(zip(col_names, r)) for r in rows]
 
+            # ── 2. Per-GW points for every player that appears in a transfer ──
+            player_ids = set()
+            for t in transfers_raw:
+                player_ids.add(t["player_in_id"])
+                player_ids.add(t["player_out_id"])
+
+            gw_pts: dict = {}   # {player_id: {gw: pts}}
+            if player_ids:
+                cur.execute("""
+                    SELECT player_id, gw, total_points
+                    FROM player_gameweek_stats
+                    WHERE season_id = %s AND player_id = ANY(%s)
+                    ORDER BY player_id, gw;
+                """, (season_id, list(player_ids)))
+                for pid, gw, pts in cur.fetchall():
+                    gw_pts.setdefault(pid, {})[gw] = pts
+
+    # ── 3. Attach per-GW chart data to each transfer ──────────────────────────
+    # Build {gw: {in: pts, out: pts}} from transfer_gw to max_gw
+    all_gws_seen: set = set()
+    for pid_map in gw_pts.values():
+        all_gws_seen.update(pid_map.keys())
+    max_gw = max(all_gws_seen) if all_gws_seen else 1
+
+    transfers = []
+    for t in transfers_raw:
+        in_id  = t["player_in_id"]
+        out_id = t["player_out_id"]
+        start  = t["gw"] + 1          # chart starts GW after transfer
+
+        chart = {}
+        for gw in range(start, max_gw + 1):
+            chart[gw] = {
+                "in":  gw_pts.get(in_id,  {}).get(gw, 0),
+                "out": gw_pts.get(out_id, {}).get(gw, 0),
+            }
+
+        # Flag snapshot: has a flag if chance_of_playing ≤ 75 or status not 'a'
+        def _flag(status, news, cop_next, cop_this):
+            if status and status != "a":
+                return {"level": status, "news": news}
+            cop = cop_this if cop_this is not None else cop_next
+            if cop is not None and cop <= 75:
+                return {"level": f"{cop}%", "news": news}
+            return None
+
+        transfers.append({
+            **{k: t[k] for k in col_names},
+            "chart_gw_points": chart,   # {gw: {in, out}}
+            "flag_in":  _flag(t["status_in"],  t["news_in"],  t["cop_next_in"],  t["cop_this_in"]),
+            "flag_out": _flag(t["status_out"], t["news_out"], t["cop_next_out"], t["cop_this_out"]),
+        })
+
+    # ── 4. Per-manager summary ────────────────────────────────────────────────
     managers: dict = {}
     for t in transfers:
         m = t["manager"]
         if m not in managers:
             managers[m] = {
                 "manager":        m,
-                "team_id":        t["team_id"],
+                "team_id":        t["internal_team_id"],
                 "total_moves":    0,
                 "net_delta":      0,
                 "best_transfer":  None,
@@ -1216,14 +1302,156 @@ def get_transfer_analytics(season_id: int):
         if managers[m]["worst_transfer"] is None or t["delta"] < managers[m]["worst_transfer"]["delta"]:
             managers[m]["worst_transfer"] = t
 
+    # Sort transfers by delta for best/worst overall
+    by_delta = sorted(transfers, key=lambda x: x["delta"], reverse=True)
+
     return {
-        "all_transfers":   transfers,
-        "best_transfer":   transfers[0]  if transfers else None,
-        "worst_transfer":  transfers[-1] if transfers else None,
+        "all_transfers":   transfers,       # already sorted GW desc
+        "best_transfer":   by_delta[0]  if by_delta else None,
+        "worst_transfer":  by_delta[-1] if by_delta else None,
         "manager_summary": list(managers.values()),
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSFER STATS PAGE  (new endpoint — add after get_transfer_analytics)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/season/{season_id}/transfer-stats")
+def get_transfer_stats(season_id: int):
+    """
+    Aggregated transfer analytics for the Transfer Stats page.
+
+    Returns:
+      - by_position          : count IN/OUT per position
+      - by_team_in / by_team_out : count per PL team split by attack (MID+FWD) / defense (GKP+DEF)
+      - by_manager           : count per fantasy manager
+      - by_gw                : count per gameweek (for "most active week")
+      - busiest_gw           : the GW with most transfers
+    """
+    _season_or_404(season_id)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # ── Position breakdown ──────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    et_in.singular_name_short  AS position,
+                    'in'                        AS direction,
+                    COUNT(*)                    AS cnt
+                FROM transactions tx
+                JOIN players p_in ON p_in.id = tx.player_in_id
+                JOIN element_type et_in ON et_in.id = p_in.position
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY et_in.singular_name_short
+                UNION ALL
+                SELECT
+                    et_out.singular_name_short AS position,
+                    'out'                       AS direction,
+                    COUNT(*)                    AS cnt
+                FROM transactions tx
+                JOIN players p_out ON p_out.id = tx.player_out_id
+                JOIN element_type et_out ON et_out.id = p_out.position
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY et_out.singular_name_short
+                ORDER BY position, direction;
+            """, (season_id, season_id))
+            pos_rows = cur.fetchall()
+
+            # ── Team breakdown ──────────────────────────────────────────────
+            # Classify MID+FWD as 'attack', GKP+DEF as 'defense'
+            cur.execute("""
+                SELECT
+                    plt.short_name                                      AS pl_team,
+                    'in'                                                AS direction,
+                    CASE WHEN et.singular_name_short IN ('MID','FWD')
+                         THEN 'attack' ELSE 'defense' END               AS group_type,
+                    COUNT(*)                                            AS cnt
+                FROM transactions tx
+                JOIN players p_in ON p_in.id = tx.player_in_id
+                JOIN element_type et ON et.id = p_in.position
+                JOIN premier_league_teams plt
+                    ON plt.id = p_in.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY plt.short_name, et.singular_name_short
+                UNION ALL
+                SELECT
+                    plt.short_name                                      AS pl_team,
+                    'out'                                               AS direction,
+                    CASE WHEN et.singular_name_short IN ('MID','FWD')
+                         THEN 'attack' ELSE 'defense' END               AS group_type,
+                    COUNT(*)                                            AS cnt
+                FROM transactions tx
+                JOIN players p_out ON p_out.id = tx.player_out_id
+                JOIN element_type et ON et.id = p_out.position
+                JOIN premier_league_teams plt
+                    ON plt.id = p_out.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY plt.short_name, et.singular_name_short
+                ORDER BY pl_team, direction;
+            """, (season_id, season_id))
+            team_rows = cur.fetchall()
+
+            # ── Per-manager count ───────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    ft.player_first_name AS manager,
+                    ft.internal_team_id,
+                    COUNT(*) AS cnt
+                FROM transactions tx
+                JOIN fantasy_teams ft
+                    ON ft.id = tx.team_id AND ft.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY ft.player_first_name, ft.internal_team_id
+                ORDER BY cnt DESC;
+            """, (season_id,))
+            mgr_rows = cur.fetchall()
+
+            # ── Per-GW count ────────────────────────────────────────────────
+            cur.execute("""
+                SELECT gw, COUNT(*) AS cnt
+                FROM transactions
+                WHERE season_id = %s AND result = 'a'
+                GROUP BY gw
+                ORDER BY gw;
+            """, (season_id,))
+            gw_rows = cur.fetchall()
+
+    # Reshape position data: {GKP: {in: N, out: N}, ...}
+    pos_map: dict = {}
+    for pos, direction, cnt in pos_rows:
+        pos_map.setdefault(pos, {"in": 0, "out": 0})[direction] = cnt
+
+    # Reshape team data: {MAN: {in: {attack: N, defense: N}, out: {...}}, ...}
+    team_map: dict = {}
+    for pl_team, direction, group_type, cnt in team_rows:
+        team_map.setdefault(pl_team, {
+            "in":  {"attack": 0, "defense": 0, "total": 0},
+            "out": {"attack": 0, "defense": 0, "total": 0},
+        })
+        team_map[pl_team][direction][group_type] += cnt
+        team_map[pl_team][direction]["total"]    += cnt
+
+    by_gw = [{"gw": r[0], "count": r[1]} for r in gw_rows]
+    busiest = max(by_gw, key=lambda x: x["count"]) if by_gw else None
+
+    return {
+        "by_position": [
+            {"position": pos, **counts}
+            for pos, counts in sorted(pos_map.items())
+        ],
+        "by_team": [
+            {"pl_team": team, **data}
+            for team, data in sorted(team_map.items(), key=lambda x: -(x[1]["in"]["total"] + x[1]["out"]["total"]))
+        ],
+        "by_manager": [
+            {"manager": r[0], "team_id": r[1], "count": r[2]}
+            for r in mgr_rows
+        ],
+        "by_gw": by_gw,
+        "busiest_gw": busiest,
+    }
 # ---------------------------------------------------------------------------
 # Fixtures upcoming
 # ---------------------------------------------------------------------------
