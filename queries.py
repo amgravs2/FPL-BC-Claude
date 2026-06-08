@@ -3,6 +3,7 @@ queries.py — read-only endpoints for the frontend.
 All heavy SQL lives here; the frontend just renders what these return.
 """
 
+import statistics
 from fastapi import APIRouter, HTTPException
 from db import get_conn
 
@@ -641,16 +642,7 @@ def get_draft_scorecard(season_id: int):
         for r in rows
     ]
 
-    # Value picks: biggest overperformers vs draft position
-    # Expected: earlier picks should score more. Compare actual vs peer picks.
-    value = sorted(picks, key=lambda x: x["season_points"], reverse=True)[:5]
-    busts = sorted(
-        [p for p in picks if p["overall_pick"] <= 36],
-        key=lambda x: x["season_points"]
-    )[:5]
-
     # Median points per round
-    import statistics
     round_stats = {}
     for p in picks:
         r = p["round"]
@@ -679,8 +671,7 @@ def get_draft_scorecard(season_id: int):
         composition[tid][p["position"]] = composition[tid].get(p["position"], 0) + 1
         composition[tid]["total_points"] += p["season_points"]
 
-    # Value score: season_points relative to pick position expectation
-    # Simple: compare each pick to the median for its round
+    # Value score: season_points relative to median for that round
     median_by_round = {r["round"]: r["median"] for r in round_medians}
     for p in picks:
         expected = median_by_round.get(p["round"], 0)
@@ -692,12 +683,65 @@ def get_draft_scorecard(season_id: int):
         key=lambda x: x["value_score"]
     )[:5]
 
+    # --- Draft DNA ---
+
+    # 1. Position counts by round pair (league-wide)
+    round_pair_labels = ['1–2', '3–4', '5–6', '7–8', '9–10', '11–12', '13–14', '15']
+    round_pair_counts = []
+    for i, label in enumerate(round_pair_labels):
+        lo = i * 2 + 1
+        hi = lo + 1
+        group = [p for p in picks if lo <= p['round'] <= hi]
+        round_pair_counts.append({
+            'group': label,
+            'GKP': sum(1 for p in group if p['position'] == 'GKP'),
+            'DEF': sum(1 for p in group if p['position'] == 'DEF'),
+            'MID': sum(1 for p in group if p['position'] == 'MID'),
+            'FWD': sum(1 for p in group if p['position'] == 'FWD'),
+        })
+
+    # 2. Mean draft round per position per manager
+    mgr_pos_rounds = {}
+    for p in picks:
+        key = (p['team_id'], p['position'])
+        mgr_pos_rounds.setdefault(key, []).append(p['round'])
+
+    mean_rounds = {}
+    for (tid, pos), rounds in mgr_pos_rounds.items():
+        mean_rounds.setdefault(tid, {})[pos] = round(sum(rounds) / len(rounds), 1)
+
+    mean_round_rows = [
+        {'team_id': tid, **pos_map}
+        for tid, pos_map in mean_rounds.items()
+    ]
+
+    # 3. Club bias — attack (MID+FWD) vs defence (GKP+DEF) per manager
+    club_bias = {}
+    for p in picks:
+        tid = p['team_id']
+        club = p['pl_team']
+        side = 'attack' if p['position'] in ('MID', 'FWD') else 'defence'
+        club_bias.setdefault(tid, {}).setdefault(club, {'attack': 0, 'defence': 0})
+        club_bias[tid][club][side] += 1
+
+    club_bias_rows = [
+        {'team_id': tid, 'clubs': clubs}
+        for tid, clubs in club_bias.items()
+    ]
+
+    dna = {
+        'round_pair_counts': round_pair_counts,
+        'mean_round_rows':   mean_round_rows,
+        'club_bias':         club_bias_rows,
+    }
+
     return {
         "picks":           picks,
         "value_picks":     value_by_score,
         "busts":           busts_by_score,
         "round_medians":   round_medians,
         "composition":     list(composition.values()),
+        "dna":             dna,
     }
 
 
@@ -1144,26 +1188,24 @@ def get_fixtures_upcoming(season_id: int):
         if ratio < 1.17: return 4
         return 5
 
-    all_atk  = [t["strength_attack_away"]  for t in teams if t["strength_attack_away"]]
-    all_def  = [t["strength_defence_away"] for t in teams if t["strength_defence_away"]]
+    all_atk   = [t["strength_attack_away"]  for t in teams if t["strength_attack_away"]]
+    all_def   = [t["strength_defence_away"] for t in teams if t["strength_defence_away"]]
     all_atk_h = [t["strength_attack_home"]  for t in teams if t["strength_attack_home"]]
     all_def_h = [t["strength_defence_home"] for t in teams if t["strength_defence_home"]]
 
     fixtures = []
     for r in fixture_rows:
         gw, team_h_id, team_a_id, kickoff = r
-        opp_h = strength_map.get(team_a_id, {})  # home team faces away opponent
-        opp_a = strength_map.get(team_h_id, {})  # away team faces home opponent
+        opp_h = strength_map.get(team_a_id, {})
+        opp_a = strength_map.get(team_h_id, {})
 
         fixtures.append({
             "gw":           gw,
             "team_h":       team_h_id,
             "team_a":       team_a_id,
             "kickoff_time": str(kickoff) if kickoff else None,
-            # Home team FDR — how hard is the away opponent's attack/defence?
             "team_h_attack_fdr":  _fdr(opp_h.get("strength_attack_away"), all_atk),
             "team_h_defence_fdr": _fdr(opp_h.get("strength_defence_away"), all_def),
-            # Away team FDR
             "team_a_attack_fdr":  _fdr(opp_a.get("strength_attack_home"), all_atk_h),
             "team_a_defence_fdr": _fdr(opp_a.get("strength_defence_home"), all_def_h),
         })
@@ -1194,7 +1236,6 @@ def get_player_history(player_id: int):
             """, (player_id,))
             rows = cur.fetchall()
 
-            # Also get current season from player_gameweek_stats
             cur.execute("""
                 SELECT SUM(total_points), SUM(minutes), SUM(goals), SUM(assists),
                        SUM(clean_sheets), SUM(bonus), SUM(saves)
