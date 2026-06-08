@@ -3,9 +3,9 @@ queries.py — read-only endpoints for the frontend.
 All heavy SQL lives here; the frontend just renders what these return.
 """
 
-import statistics
 from fastapi import APIRouter, HTTPException
 from db import get_conn
+from fpl_client import fetch_fpl_bootstrap, fetch_fixtures
 
 router = APIRouter(prefix="/query", tags=["query"])
 
@@ -25,7 +25,7 @@ def _season_or_404(season_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Seasons list — for the season picker in the UI
+# Seasons list
 # ---------------------------------------------------------------------------
 
 @router.get("/seasons")
@@ -45,7 +45,7 @@ def get_seasons():
 
 
 # ---------------------------------------------------------------------------
-# Season overview
+# Season summary — final standings table
 # ---------------------------------------------------------------------------
 
 @router.get("/season/{season_id}/summary")
@@ -96,6 +96,10 @@ def get_season_summary(season_id: int):
     ]
 
 
+# ---------------------------------------------------------------------------
+# Standings chart — cumulative points by GW
+# ---------------------------------------------------------------------------
+
 @router.get("/season/{season_id}/standings-chart")
 def get_standings_chart(season_id: int):
     """Cumulative points by team by GW — feeds the animated chart."""
@@ -134,6 +138,10 @@ def get_standings_chart(season_id: int):
         for r in rows
     ]
 
+
+# ---------------------------------------------------------------------------
+# Results grid — GW-by-GW match results
+# ---------------------------------------------------------------------------
 
 @router.get("/season/{season_id}/results-grid")
 def get_results_grid(season_id: int):
@@ -180,7 +188,7 @@ def get_results_grid(season_id: int):
 
 
 # ---------------------------------------------------------------------------
-# H2H matrix
+# H2H matrix — this season
 # ---------------------------------------------------------------------------
 
 @router.get("/season/{season_id}/h2h")
@@ -230,7 +238,7 @@ def get_h2h(season_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Season records (fun stats)
+# Season records — fun stats
 # ---------------------------------------------------------------------------
 
 @router.get("/season/{season_id}/records")
@@ -239,119 +247,116 @@ def get_season_records(season_id: int):
     _season_or_404(season_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
-
-            # Highest scoring week
             cur.execute("""
                 SELECT ft.player_first_name, s.gw, s.points_for
                 FROM standings s
-                JOIN fantasy_teams ft ON ft.internal_team_id = s.team_id
+                JOIN fantasy_teams ft
+                    ON ft.internal_team_id = s.team_id
                     AND ft.season_id = s.season_id
                 WHERE s.season_id = %s
                 ORDER BY s.points_for DESC LIMIT 1;
             """, (season_id,))
             high = cur.fetchone()
 
-            # Lowest scoring week
             cur.execute("""
                 SELECT ft.player_first_name, s.gw, s.points_for
                 FROM standings s
-                JOIN fantasy_teams ft ON ft.internal_team_id = s.team_id
+                JOIN fantasy_teams ft
+                    ON ft.internal_team_id = s.team_id
                     AND ft.season_id = s.season_id
                 WHERE s.season_id = %s
                 ORDER BY s.points_for ASC LIMIT 1;
             """, (season_id,))
             low = cur.fetchone()
 
-            # Biggest winning margin
             cur.execute("""
                 SELECT
-                    t1.player_first_name AS winner,
-                    t2.player_first_name AS loser,
-                    s.gw,
-                    s.points_for,
-                    s.points_against,
+                    t1.player_first_name, t2.player_first_name, s.gw,
+                    s.points_for, s.points_against,
                     (s.points_for - s.points_against) AS margin
                 FROM standings s
-                JOIN fantasy_teams t1 ON t1.internal_team_id = s.team_id
-                    AND t1.season_id = s.season_id
-                JOIN fantasy_teams t2 ON t2.internal_team_id = s.opponent_id
-                    AND t2.season_id = s.season_id
+                JOIN fantasy_teams t1
+                    ON t1.internal_team_id = s.team_id AND t1.season_id = s.season_id
+                JOIN fantasy_teams t2
+                    ON t2.internal_team_id = s.opponent_id AND t2.season_id = s.season_id
                 WHERE s.season_id = %s AND s.result = 'w'
                 ORDER BY margin DESC LIMIT 1;
             """, (season_id,))
             margin = cur.fetchone()
 
-            # Most points in a losing effort
             cur.execute("""
-                SELECT ft.player_first_name, s.gw, s.points_for, s.points_against
+                SELECT
+                    ft.player_first_name, s.gw, s.points_for, s.points_against
                 FROM standings s
-                JOIN fantasy_teams ft ON ft.internal_team_id = s.team_id
-                    AND ft.season_id = s.season_id
+                JOIN fantasy_teams ft
+                    ON ft.internal_team_id = s.team_id AND ft.season_id = s.season_id
                 WHERE s.season_id = %s AND s.result = 'l'
                 ORDER BY s.points_for DESC LIMIT 1;
             """, (season_id,))
             unlucky = cur.fetchone()
 
-            # Closest match
             cur.execute("""
                 SELECT
-                    t1.player_first_name AS winner,
-                    t2.player_first_name AS loser,
-                    s.gw, s.points_for, s.points_against,
+                    t1.player_first_name, t2.player_first_name, s.gw,
+                    s.points_for, s.points_against,
                     ABS(s.points_for - s.points_against) AS margin
                 FROM standings s
-                JOIN fantasy_teams t1 ON t1.internal_team_id = s.team_id
-                    AND t1.season_id = s.season_id
-                JOIN fantasy_teams t2 ON t2.internal_team_id = s.opponent_id
-                    AND t2.season_id = s.season_id
-                WHERE s.season_id = %s AND s.result != 'd'
-                ORDER BY margin ASC, s.gw ASC LIMIT 1;
+                JOIN fantasy_teams t1
+                    ON t1.internal_team_id = s.team_id AND t1.season_id = s.season_id
+                JOIN fantasy_teams t2
+                    ON t2.internal_team_id = s.opponent_id AND t2.season_id = s.season_id
+                WHERE s.season_id = %s
+                ORDER BY margin ASC LIMIT 1;
             """, (season_id,))
             closest = cur.fetchone()
 
             # Longest win streak
             cur.execute("""
-                WITH ordered AS (
-                    SELECT team_id, gw, result,
-                           ROW_NUMBER() OVER (PARTITION BY team_id ORDER BY gw) -
-                           ROW_NUMBER() OVER (PARTITION BY team_id, result ORDER BY gw) AS grp
-                    FROM standings WHERE season_id = %s
-                ),
-                streaks AS (
-                    SELECT team_id, result, COUNT(*) AS streak_len, MIN(gw) AS start_gw, MAX(gw) AS end_gw
-                    FROM ordered WHERE result = 'w'
-                    GROUP BY team_id, result, grp
+                WITH streaks AS (
+                    SELECT
+                        ft.player_first_name AS manager,
+                        s.gw,
+                        s.result,
+                        s.gw - ROW_NUMBER() OVER (
+                            PARTITION BY ft.player_first_name, s.result
+                            ORDER BY s.gw
+                        ) AS grp
+                    FROM standings s
+                    JOIN fantasy_teams ft
+                        ON ft.internal_team_id = s.team_id AND ft.season_id = s.season_id
+                    WHERE s.season_id = %s
                 )
-                SELECT ft.player_first_name, s.streak_len, s.start_gw, s.end_gw
-                FROM streaks s
-                JOIN fantasy_teams ft ON ft.internal_team_id = s.team_id
-                    AND ft.season_id = %s
-                ORDER BY s.streak_len DESC LIMIT 1;
-            """, (season_id, season_id))
+                SELECT manager, COUNT(*) AS length, MIN(gw) AS start_gw, MAX(gw) AS end_gw
+                FROM streaks
+                WHERE result = 'w'
+                GROUP BY manager, grp
+                ORDER BY length DESC LIMIT 1;
+            """, (season_id,))
             win_streak = cur.fetchone()
 
-            # Longest losing streak
             cur.execute("""
-                WITH ordered AS (
-                    SELECT team_id, gw, result,
-                           ROW_NUMBER() OVER (PARTITION BY team_id ORDER BY gw) -
-                           ROW_NUMBER() OVER (PARTITION BY team_id, result ORDER BY gw) AS grp
-                    FROM standings WHERE season_id = %s
-                ),
-                streaks AS (
-                    SELECT team_id, result, COUNT(*) AS streak_len, MIN(gw) AS start_gw, MAX(gw) AS end_gw
-                    FROM ordered WHERE result = 'l'
-                    GROUP BY team_id, result, grp
+                WITH streaks AS (
+                    SELECT
+                        ft.player_first_name AS manager,
+                        s.gw,
+                        s.result,
+                        s.gw - ROW_NUMBER() OVER (
+                            PARTITION BY ft.player_first_name, s.result
+                            ORDER BY s.gw
+                        ) AS grp
+                    FROM standings s
+                    JOIN fantasy_teams ft
+                        ON ft.internal_team_id = s.team_id AND ft.season_id = s.season_id
+                    WHERE s.season_id = %s
                 )
-                SELECT ft.player_first_name, s.streak_len, s.start_gw, s.end_gw
-                FROM streaks s
-                JOIN fantasy_teams ft ON ft.internal_team_id = s.team_id
-                    AND ft.season_id = %s
-                ORDER BY s.streak_len DESC LIMIT 1;
-            """, (season_id, season_id))
+                SELECT manager, COUNT(*) AS length, MIN(gw) AS start_gw, MAX(gw) AS end_gw
+                FROM streaks
+                WHERE result = 'l'
+                GROUP BY manager, grp
+                ORDER BY length DESC LIMIT 1;
+            """, (season_id,))
             loss_streak = cur.fetchone()
 
-            # Bench points per manager (from gameweek_lineups + player_gameweek_stats)
             cur.execute("""
                 SELECT
                     ft.player_first_name,
@@ -362,8 +367,7 @@ def get_season_records(season_id: int):
                     AND pgs.gw = gl.gw
                     AND pgs.season_id = gl.season_id
                 JOIN fantasy_teams ft
-                    ON ft.id = gl.team_id
-                    AND ft.season_id = gl.season_id
+                    ON ft.id = gl.team_id AND ft.season_id = gl.season_id
                 WHERE gl.season_id = %s
                     AND gl.position > 11
                     AND gl.multiplier = 0
@@ -406,7 +410,7 @@ def get_season_records(season_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Manager profile
+# Manager profile — full per-manager breakdown
 # ---------------------------------------------------------------------------
 
 @router.get("/season/{season_id}/manager/{team_id}")
@@ -415,7 +419,6 @@ def get_manager_profile(season_id: int, team_id: int):
     _season_or_404(season_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
-
             # Weekly scores + rank
             cur.execute("""
                 SELECT
@@ -438,7 +441,7 @@ def get_manager_profile(season_id: int, team_id: int):
             """, (season_id, team_id))
             weekly = cur.fetchall()
 
-            # Points breakdown by position
+            # Points breakdown by position (starters only)
             cur.execute("""
                 SELECT
                     et.singular_name_short AS position,
@@ -453,7 +456,7 @@ def get_manager_profile(season_id: int, team_id: int):
                     SUM(pgs.minutes)       AS minutes,
                     SUM(pgs.goals_conceded) AS goals_conceded,
                     SUM(pgs.own_goals)     AS own_goals,
-                    SUM(pgs.penalties_saved) AS penalties_saved,
+                    SUM(pgs.penalties_saved)  AS penalties_saved,
                     SUM(pgs.penalties_missed) AS penalties_missed,
                     SUM(pgs.tackles)       AS tackles,
                     SUM(pgs.recoveries)    AS recoveries,
@@ -533,25 +536,25 @@ def get_manager_profile(season_id: int, team_id: int):
         ],
         "by_position": [
             {
-                "position":         r[0],
-                "points":           r[1],
-                "goals":            r[2],
-                "assists":          r[3],
-                "clean_sheets":     r[4],
-                "bonus":            r[5],
-                "saves":            r[6],
-                "yellow_cards":     r[7],
-                "red_cards":        r[8],
-                "minutes":          r[9],
-                "goals_conceded":   r[10],
-                "own_goals":        r[11],
-                "penalties_saved":  r[12],
-                "penalties_missed": r[13],
-                "tackles":          r[14],
-                "recoveries":       r[15],
-                "cbi":              r[16],
+                "position":               r[0],
+                "points":                 r[1],
+                "goals":                  r[2],
+                "assists":                r[3],
+                "clean_sheets":           r[4],
+                "bonus":                  r[5],
+                "saves":                  r[6],
+                "yellow_cards":           r[7],
+                "red_cards":              r[8],
+                "minutes":                r[9],
+                "goals_conceded":         r[10],
+                "own_goals":              r[11],
+                "penalties_saved":        r[12],
+                "penalties_missed":       r[13],
+                "tackles":                r[14],
+                "recoveries":             r[15],
+                "cbi":                    r[16],
                 "defensive_contribution": r[17],
-                "bps":              r[18],
+                "bps":                    r[18],
             }
             for r in by_position
         ],
@@ -569,16 +572,79 @@ def get_manager_profile(season_id: int, team_id: int):
         ],
         "transfers": [
             {
-                "gw":           r[0],
-                "kind":         r[1],
-                "result":       r[2],
-                "player_in":    r[3],
-                "player_out":   r[4],
-                "player_in_id": r[5],
+                "gw":            r[0],
+                "kind":          r[1],
+                "result":        r[2],
+                "player_in":     r[3],
+                "player_out":    r[4],
+                "player_in_id":  r[5],
                 "player_out_id": r[6],
             }
             for r in transfers
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GW lineup for a specific team + gameweek
+# ---------------------------------------------------------------------------
+
+@router.get("/season/{season_id}/lineup/{team_id}/{gw}")
+def get_gw_lineup(season_id: int, team_id: int, gw: int):
+    """Returns starters and bench for a team in a specific GW with points."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    gl.position,
+                    gl.is_captain,
+                    gl.is_vice_captain,
+                    gl.multiplier,
+                    p.first_name || ' ' || p.second_name AS player_name,
+                    p.web_name,
+                    p.id AS player_id,
+                    et.singular_name_short AS pos,
+                    COALESCE(pgs.total_points, 0) AS points,
+                    COALESCE(pgs.minutes, 0)       AS minutes,
+                    COALESCE(pgs.goals, 0)         AS goals,
+                    COALESCE(pgs.assists, 0)       AS assists,
+                    COALESCE(pgs.bonus, 0)         AS bonus
+                FROM gameweek_lineups gl
+                JOIN players p ON p.id = gl.player_id
+                JOIN element_type et ON et.id = p.position
+                LEFT JOIN player_gameweek_stats pgs
+                    ON pgs.player_id = gl.player_id
+                    AND pgs.season_id = gl.season_id
+                    AND pgs.gw = gl.gw
+                WHERE gl.season_id = %s
+                    AND gl.team_id = %s
+                    AND gl.gw = %s
+                ORDER BY gl.position;
+            """, (season_id, team_id, gw))
+            rows = cur.fetchall()
+
+    picks = [
+        {
+            "position":        r[0],
+            "is_captain":      r[1],
+            "is_vice_captain": r[2],
+            "multiplier":      r[3],
+            "player_name":     r[4],
+            "web_name":        r[5],
+            "player_id":       r[6],
+            "pos":             r[7],
+            "points":          r[8],
+            "minutes":         r[9],
+            "goals":           r[10],
+            "assists":         r[11],
+            "bonus":           r[12],
+        }
+        for r in rows
+    ]
+
+    return {
+        "starters": [p for p in picks if p["position"] <= 11],
+        "bench":    [p for p in picks if p["position"] > 11],
     }
 
 
@@ -642,7 +708,8 @@ def get_draft_scorecard(season_id: int):
         for r in rows
     ]
 
-    # Median points per round
+    # Value picks: biggest overperformers vs draft position
+    import statistics
     round_stats = {}
     for p in picks:
         r = p["round"]
@@ -671,7 +738,6 @@ def get_draft_scorecard(season_id: int):
         composition[tid][p["position"]] = composition[tid].get(p["position"], 0) + 1
         composition[tid]["total_points"] += p["season_points"]
 
-    # Value score: season_points relative to median for that round
     median_by_round = {r["round"]: r["median"] for r in round_medians}
     for p in picks:
         expected = median_by_round.get(p["round"], 0)
@@ -683,100 +749,27 @@ def get_draft_scorecard(season_id: int):
         key=lambda x: x["value_score"]
     )[:5]
 
-    # --- Draft DNA ---
-
-    # 1. Position counts by round pair (league-wide)
-    round_pair_labels = ['1–2', '3–4', '5–6', '7–8', '9–10', '11–12', '13–14', '15']
-    round_pair_counts = []
-    for i, label in enumerate(round_pair_labels):
-        lo = i * 2 + 1
-        hi = lo + 1
-        group = [p for p in picks if lo <= p['round'] <= hi]
-        round_pair_counts.append({
-            'group': label,
-            'GKP': sum(1 for p in group if p['position'] == 'GKP'),
-            'DEF': sum(1 for p in group if p['position'] == 'DEF'),
-            'MID': sum(1 for p in group if p['position'] == 'MID'),
-            'FWD': sum(1 for p in group if p['position'] == 'FWD'),
-        })
-
-    # 2. Mean draft round per position per manager
-    mgr_pos_rounds = {}
-    for p in picks:
-        key = (p['team_id'], p['position'])
-        mgr_pos_rounds.setdefault(key, []).append(p['round'])
-
-    mean_rounds = {}
-    for (tid, pos), rounds in mgr_pos_rounds.items():
-        mean_rounds.setdefault(tid, {})[pos] = round(sum(rounds) / len(rounds), 1)
-
-    mean_round_rows = [
-        {'team_id': tid, **pos_map}
-        for tid, pos_map in mean_rounds.items()
-    ]
-
-    # 3. Club bias — attack (MID+FWD) vs defence (GKP+DEF) per manager
-    # Per-manager club bias
-    club_bias = {}
-    for p in picks:
-        tid = p['team_id']
-        club = p['pl_team']
-        side = 'attack' if p['position'] in ('MID', 'FWD') else 'defence'
-        club_bias.setdefault(tid, {}).setdefault(club, {'attack': 0, 'defence': 0})
-        club_bias[tid][club][side] += 1
-
-    club_bias_rows = [
-        {'team_id': tid, 'clubs': clubs}
-        for tid, clubs in club_bias.items()
-    ]
-
-    # League-wide club bias (all managers combined)
-    league_club_bias = {}
-    for p in picks:
-        club = p['pl_team']
-        side = 'attack' if p['position'] in ('MID', 'FWD') else 'defence'
-        league_club_bias.setdefault(club, {'attack': 0, 'defence': 0})
-        league_club_bias[club][side] += 1
-
-    league_club_bias_list = [
-        {'club': club, 'attack': counts['attack'], 'defence': counts['defence']}
-        for club, counts in sorted(league_club_bias.items(),
-                                   key=lambda x: x[1]['attack'] + x[1]['defence'],
-                                   reverse=True)
-    ]
-
-    dna = {
-        'round_pair_counts':   round_pair_counts,
-        'mean_round_rows':     mean_round_rows,
-        'club_bias':           club_bias_rows,
-        'league_club_bias':    league_club_bias_list,
-    }
-
     return {
-        "picks":           picks,
-        "value_picks":     value_by_score,
-        "busts":           busts_by_score,
-        "round_medians":   round_medians,
-        "composition":     list(composition.values()),
-        "dna":             dna,
+        "picks":         picks,
+        "value_picks":   value_by_score,
+        "busts":         busts_by_score,
+        "round_medians": round_medians,
+        "composition":   list(composition.values()),
     }
 
 
 # ---------------------------------------------------------------------------
-# Player stats
+# Player stats — season totals with ownership
+#
+# FIX: HAVING clause now keeps owned players even with 0 pts.
+# FIX: pfs.team_id joins to ft.id (= entry_id, the large number like 115464)
+#      and returns ft.internal_team_id as owner_team_id for the frontend managerMap.
+# NEW: adds defensive_contribution, pl_team_full, pl_team_id, status/news/flags.
 # ---------------------------------------------------------------------------
 
 @router.get("/season/{season_id}/players")
 def get_player_stats(season_id: int):
-    """All players with season stats + fantasy ownership info.
-    
-    FIXES:
-    - Free agent bug: the old query used HAVING total_points > 0 which caused
-      all owned players with 0 pts to show as FA. Now we include owned players
-      regardless of points, and only exclude unowned 0-pt players.
-    - Adds: defensive_contribution, pl_team_full, status, news,
-      chance_of_playing_next_round, chance_of_playing_this_round
-    """
+    """All players with season stats + fantasy ownership info."""
     _season_or_404(season_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -826,13 +819,13 @@ def get_player_stats(season_id: int):
                     p.chance_of_playing_next_round, p.chance_of_playing_this_round,
                     p.team
                 HAVING
-                    -- Include owned players always; exclude unowned 0-pt players
+                    -- Keep owned players regardless of points; exclude unowned 0-pt players
                     ft.internal_team_id IS NOT NULL
                     OR COALESCE(SUM(pgs.total_points), 0) > 0
                 ORDER BY total_points DESC;
             """, (season_id, season_id, season_id, season_id, season_id))
             rows = cur.fetchall()
- 
+
     return [
         {
             "player_id":                    r[0],
@@ -864,61 +857,23 @@ def get_player_stats(season_id: int):
         for r in rows
     ]
 
- 
+
 # ---------------------------------------------------------------------------
-# NEW: Player drill-through page data
+# Per-player GW breakdown for the expanded row
+#
+# Primary source: player_gameweek_stats (populated by /sync/stats/{gw})
+# Fallback: player_fixture_history grouped by GW (populated by /sync/element-summaries)
+#           Used when season is over and GW syncs were never run.
 # ---------------------------------------------------------------------------
- 
-@router.get("/player/{player_id}/drill")
-def get_player_drill(player_id: int):
-    """
-    Full drill-through for a player:
-    - Basic info (name, position, team)
-    - Historic season totals (from player_season_history)
-    - Per-GW stats per season (from player_gameweek_stats)
-    - Ownership history across all seasons (who owned them each GW)
-    - Fixture history vs each real PL opponent (from player_fixture_history)
-    """
+
+@router.get("/season/{season_id}/player/{player_id}/gw-stats")
+def get_player_gw_stats(season_id: int, player_id: int):
+    """Per-GW stats for a player in a given season."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Player meta
+            # Try primary source first
             cur.execute("""
                 SELECT
-                    p.id, p.first_name, p.second_name, p.web_name,
-                    et.singular_name_short AS position,
-                    plt.name               AS pl_team_full,
-                    plt.short_name         AS pl_team,
-                    p.status, p.news,
-                    p.chance_of_playing_next_round
-                FROM players p
-                JOIN element_type et ON et.id = p.position
-                JOIN premier_league_teams plt
-                    ON plt.id = p.team AND plt.season_id = p.season_id
-                WHERE p.id = %s
-                ORDER BY p.season_id DESC
-                LIMIT 1;
-            """, (player_id,))
-            meta = cur.fetchone()
- 
-            if not meta:
-                raise HTTPException(status_code=404, detail="Player not found")
- 
-            # Historical season totals
-            cur.execute("""
-                SELECT season_name, total_points, minutes, goals_scored, assists,
-                       clean_sheets, bonus, saves, yellow_cards, red_cards,
-                       start_cost, end_cost
-                FROM player_season_history
-                WHERE player_id = %s
-                ORDER BY season_name DESC;
-            """, (player_id,))
-            season_history = cur.fetchall()
- 
-            # Current season GW-by-GW (all seasons in our DB)
-            cur.execute("""
-                SELECT
-                    se.name    AS season_name,
-                    pgs.season_id,
                     pgs.gw,
                     pgs.total_points,
                     pgs.goals,
@@ -929,174 +884,157 @@ def get_player_drill(player_id: int):
                     pgs.minutes,
                     pgs.yellow_cards,
                     pgs.red_cards,
-                    pgs.defensive_contribution
+                    pgs.goals_conceded,
+                    pgs.defensive_contribution,
+                    COALESCE(pgs.expected_goals, 0)   AS xg,
+                    COALESCE(pgs.expected_assists, 0) AS xa,
+                    pgs.bps,
+                    ft.player_first_name AS owner_this_gw,
+                    ft.internal_team_id  AS owner_team_id_this_gw
                 FROM player_gameweek_stats pgs
-                JOIN seasons se ON se.id = pgs.season_id
+                LEFT JOIN gameweek_lineups gl
+                    ON gl.player_id = pgs.player_id
+                    AND gl.season_id = pgs.season_id
+                    AND gl.gw = pgs.gw
+                LEFT JOIN fantasy_teams ft
+                    ON ft.id = gl.team_id
+                    AND ft.season_id = pgs.season_id
                 WHERE pgs.player_id = %s
-                ORDER BY pgs.season_id DESC, pgs.gw ASC;
-            """, (player_id,))
-            gw_stats = cur.fetchall()
- 
-            # Ownership history: who owned this player each GW across all seasons
+                  AND pgs.season_id = %s
+                ORDER BY pgs.gw;
+            """, (player_id, season_id))
+            primary_rows = cur.fetchall()
+
+            if primary_rows:
+                return [
+                    {
+                        "gw":                     r[0],
+                        "total_points":           r[1],
+                        "goals":                  r[2],
+                        "assists":                r[3],
+                        "clean_sheets":           r[4],
+                        "bonus":                  r[5],
+                        "saves":                  r[6],
+                        "minutes":                r[7],
+                        "yellow_cards":           r[8],
+                        "red_cards":              r[9],
+                        "goals_conceded":         r[10],
+                        "defensive_contribution": r[11],
+                        "expected_goals":         float(r[12]) if r[12] else 0,
+                        "expected_assists":       float(r[13]) if r[13] else 0,
+                        "bps":                    r[14],
+                        "owner_this_gw":          r[15],
+                        "owner_team_id_this_gw":  r[16],
+                    }
+                    for r in primary_rows
+                ]
+
+            # Fallback: player_fixture_history grouped by GW
+            cur.execute("SELECT name FROM seasons WHERE id = %s", (season_id,))
+            season_row = cur.fetchone()
+            if not season_row:
+                return []
+            season_name = season_row[0]
+
             cur.execute("""
                 SELECT
-                    se.name    AS season_name,
-                    gl.season_id,
-                    gl.gw,
-                    ft.player_first_name  AS owner,
-                    ft.team_name          AS team_name,
-                    ft.internal_team_id   AS team_id,
-                    gl.multiplier,
-                    gl.is_captain
-                FROM gameweek_lineups gl
-                JOIN fantasy_teams ft
-                    ON ft.id = gl.team_id AND ft.season_id = gl.season_id
-                JOIN seasons se ON se.id = gl.season_id
-                WHERE gl.player_id = %s
-                ORDER BY gl.season_id DESC, gl.gw ASC;
-            """, (player_id,))
-            ownership = cur.fetchall()
- 
-            # Fixture-level history vs each PL opponent
-            cur.execute("""
-                SELECT
-                    pfh.opponent_team,
-                    plt.name               AS opponent_full,
-                    plt.short_name         AS opponent_short,
-                    pfh.was_home,
-                    pfh.kickoff_time,
-                    pfh.total_points,
-                    pfh.goals_scored,
-                    pfh.assists,
-                    pfh.clean_sheet,
-                    pfh.saves,
-                    pfh.bonus,
-                    pfh.minutes,
-                    pfh.yellow_cards,
-                    pfh.red_cards,
-                    pfh.value,
-                    pfh.round
+                    pfh.gw,
+                    SUM(pfh.total_points)   AS total_points,
+                    SUM(pfh.goals_scored)   AS goals,
+                    SUM(pfh.assists)        AS assists,
+                    SUM(pfh.clean_sheets)   AS clean_sheets,
+                    SUM(pfh.bonus)          AS bonus,
+                    SUM(pfh.saves)          AS saves,
+                    SUM(pfh.minutes)        AS minutes,
+                    SUM(pfh.yellow_cards)   AS yellow_cards,
+                    SUM(pfh.red_cards)      AS red_cards,
+                    SUM(pfh.goals_conceded) AS goals_conceded,
+                    SUM(pfh.bps)            AS bps
                 FROM player_fixture_history pfh
-                LEFT JOIN premier_league_teams plt
-                    ON plt.id = pfh.opponent_team
                 WHERE pfh.player_id = %s
-                ORDER BY pfh.kickoff_time DESC;
-            """, (player_id,))
-            fixture_history = cur.fetchall()
- 
-    # Aggregate per-opponent stats
-    opponent_agg = {}
-    for r in fixture_history:
-        opp_id = r[0]
-        if opp_id not in opponent_agg:
-            opponent_agg[opp_id] = {
-                "opponent_id":    opp_id,
-                "opponent_full":  r[1] or f"Team {opp_id}",
-                "opponent_short": r[2] or "???",
-                "appearances":    0,
-                "total_points":   0,
-                "goals":          0,
-                "assists":        0,
-                "clean_sheets":   0,
-                "bonus":          0,
-                "minutes":        0,
-            }
-        ag = opponent_agg[opp_id]
-        ag["appearances"]  += 1
-        ag["total_points"] += r[5] or 0
-        ag["goals"]        += r[6] or 0
-        ag["assists"]      += r[7] or 0
-        ag["clean_sheets"] += r[8] or 0
-        ag["bonus"]        += r[10] or 0
-        ag["minutes"]      += r[11] or 0
- 
-    return {
-        "player": {
-            "id":                           meta[0],
-            "name":                         f"{meta[1]} {meta[2]}",
-            "web_name":                     meta[3],
-            "position":                     meta[4],
-            "pl_team_full":                 meta[5],
-            "pl_team":                      meta[6],
-            "status":                       meta[7],
-            "news":                         meta[8],
-            "chance_of_playing_next_round": meta[9],
-        },
-        "season_history": [
-            {
-                "season":       r[0],
-                "total_points": r[1],
-                "minutes":      r[2],
-                "goals":        r[3],
-                "assists":      r[4],
-                "clean_sheets": r[5],
-                "bonus":        r[6],
-                "saves":        r[7],
-                "yellow_cards": r[8],
-                "red_cards":    r[9],
-                "start_cost":   r[10] / 10 if r[10] else None,
-                "end_cost":     r[11] / 10 if r[11] else None,
-            }
-            for r in season_history
-        ],
-        "gw_stats": [
-            {
-                "season_name":            r[0],
-                "season_id":              r[1],
-                "gw":                     r[2],
-                "total_points":           r[3],
-                "goals":                  r[4],
-                "assists":                r[5],
-                "clean_sheets":           r[6],
-                "bonus":                  r[7],
-                "saves":                  r[8],
-                "minutes":                r[9],
-                "yellow_cards":           r[10],
-                "red_cards":              r[11],
-                "defensive_contribution": r[12],
-            }
-            for r in gw_stats
-        ],
-        "ownership_history": [
-            {
-                "season_name": r[0],
-                "season_id":   r[1],
-                "gw":          r[2],
-                "owner":       r[3],
-                "team_name":   r[4],
-                "team_id":     r[5],
-                "multiplier":  r[6],
-                "is_captain":  r[7],
-            }
-            for r in ownership
-        ],
-        "fixture_history": [
-            {
-                "opponent_id":    r[0],
-                "opponent_full":  r[1] or f"Team {r[0]}",
-                "opponent_short": r[2] or "???",
-                "was_home":       r[3],
-                "kickoff_time":   str(r[4]) if r[4] else None,
-                "total_points":   r[5],
-                "goals":          r[6],
-                "assists":        r[7],
-                "clean_sheet":    r[8],
-                "saves":          r[9],
-                "bonus":          r[10],
-                "minutes":        r[11],
-                "yellow_cards":   r[12],
-                "red_cards":      r[13],
-                "value":          r[14] / 10 if r[14] else None,
-                "round":          r[15],
-            }
-            for r in fixture_history
-        ],
-        "vs_opponents": sorted(
-            list(opponent_agg.values()),
-            key=lambda x: x["total_points"],
-            reverse=True
-        ),
-    }
+                  AND pfh.season_name = %s
+                GROUP BY pfh.gw
+                ORDER BY pfh.gw;
+            """, (player_id, season_name))
+            fallback_rows = cur.fetchall()
+
+    return [
+        {
+            "gw":                     r[0],
+            "total_points":           r[1],
+            "goals":                  r[2],
+            "assists":                r[3],
+            "clean_sheets":           r[4],
+            "bonus":                  r[5],
+            "saves":                  r[6],
+            "minutes":                r[7],
+            "yellow_cards":           r[8],
+            "red_cards":              r[9],
+            "goals_conceded":         r[10],
+            "defensive_contribution": 0,
+            "expected_goals":         0,
+            "expected_assists":       0,
+            "bps":                    r[11],
+            "owner_this_gw":          None,
+            "owner_team_id_this_gw":  None,
+        }
+        for r in fallback_rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Per-player ownership history for a season
+# ---------------------------------------------------------------------------
+
+@router.get("/season/{season_id}/player/{player_id}/ownership")
+def get_player_ownership(season_id: int, player_id: int):
+    """
+    Returns ownership spans for a player in a season.
+    Uses player_ownership_history (from draft+transactions) if available,
+    falls back to player_fantasy_status (current snapshot only).
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    poh.from_gw,
+                    poh.to_gw,
+                    ft.player_first_name  AS owner,
+                    ft.team_name,
+                    ft.internal_team_id   AS team_id
+                FROM player_ownership_history poh
+                JOIN fantasy_teams ft
+                    ON ft.id = poh.team_id AND ft.season_id = poh.season_id
+                WHERE poh.season_id = %s AND poh.player_id = %s
+                ORDER BY poh.from_gw;
+            """, (season_id, player_id))
+            history_rows = cur.fetchall()
+
+            if not history_rows:
+                cur.execute("""
+                    SELECT
+                        1 AS from_gw,
+                        NULL AS to_gw,
+                        ft.player_first_name  AS owner,
+                        ft.team_name,
+                        ft.internal_team_id   AS team_id
+                    FROM player_fantasy_status pfs
+                    JOIN fantasy_teams ft
+                        ON ft.id = pfs.team_id AND ft.season_id = pfs.season_id
+                    WHERE pfs.season_id = %s AND pfs.player_id = %s;
+                """, (season_id, player_id))
+                history_rows = cur.fetchall()
+
+    return [
+        {
+            "from_gw":   r[0],
+            "to_gw":     r[1],
+            "owner":     r[2],
+            "team_name": r[3],
+            "team_id":   r[4],
+        }
+        for r in history_rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1105,11 +1043,7 @@ def get_player_drill(player_id: int):
 
 @router.get("/season/{season_id}/transfers")
 def get_transfer_analytics(season_id: int):
-    """
-    Transfer activity per manager with post-transfer point delta.
-    Delta = points scored by player_in after transfer GW
-            minus points scored by player_out after transfer GW.
-    """
+    """Transfer activity per manager with post-transfer point delta."""
     _season_or_404(season_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -1174,38 +1108,122 @@ def get_transfer_analytics(season_id: int):
         for r in rows
     ]
 
-    # Per-manager summary
     managers: dict = {}
     for t in transfers:
         m = t["manager"]
         if m not in managers:
             managers[m] = {
-                "manager":       m,
-                "team_id":       t["team_id"],
-                "total_moves":   0,
-                "net_delta":     0,
-                "best_transfer": None,
+                "manager":        m,
+                "team_id":        t["team_id"],
+                "total_moves":    0,
+                "net_delta":      0,
+                "best_transfer":  None,
                 "worst_transfer": None,
             }
         managers[m]["total_moves"] += 1
         managers[m]["net_delta"]   += t["delta"]
-        if managers[m]["best_transfer"] is None or \
-                t["delta"] > managers[m]["best_transfer"]["delta"]:
+        if managers[m]["best_transfer"] is None or t["delta"] > managers[m]["best_transfer"]["delta"]:
             managers[m]["best_transfer"] = t
-        if managers[m]["worst_transfer"] is None or \
-                t["delta"] < managers[m]["worst_transfer"]["delta"]:
+        if managers[m]["worst_transfer"] is None or t["delta"] < managers[m]["worst_transfer"]["delta"]:
             managers[m]["worst_transfer"] = t
 
     return {
-        "all_transfers":      transfers,
-        "best_transfer":      transfers[0]  if transfers else None,
-        "worst_transfer":     transfers[-1] if transfers else None,
-        "manager_summary":    list(managers.values()),
+        "all_transfers":   transfers,
+        "best_transfer":   transfers[0]  if transfers else None,
+        "worst_transfer":  transfers[-1] if transfers else None,
+        "manager_summary": list(managers.values()),
     }
 
 
 # ---------------------------------------------------------------------------
-# All-time H2H (across all seasons in DB)
+# Fixtures upcoming — for fixture difficulty grid
+# ---------------------------------------------------------------------------
+
+@router.get("/season/{season_id}/fixtures-upcoming")
+def get_fixtures_upcoming(season_id: int):
+    """Returns upcoming fixtures with attack/defence FDR from FPL main bootstrap."""
+    _season_or_404(season_id)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(MAX(gw), 1) FROM player_gameweek_stats
+                WHERE season_id = %s;
+            """, (season_id,))
+            current_gw = cur.fetchone()[0]
+
+            cur.execute("""
+                SELECT f.gw, f.team_h, f.team_a, f.kickoff_time
+                FROM fixtures f
+                WHERE f.season_id = %s AND f.gw >= %s AND f.gw <= %s
+                ORDER BY f.gw, f.kickoff_time;
+            """, (season_id, current_gw, current_gw + 6))
+            fixture_rows = cur.fetchall()
+
+    try:
+        bootstrap = fetch_fpl_bootstrap()
+        fpl_teams = bootstrap.get("teams", [])
+    except Exception:
+        fpl_teams = []
+
+    teams = [
+        {
+            "id":                    t["id"],
+            "name":                  t["name"],
+            "short_name":            t["short_name"],
+            "strength_overall_home": t.get("strength_overall_home", 1200),
+            "strength_overall_away": t.get("strength_overall_away", 1200),
+            "strength_attack_home":  t.get("strength_attack_home", 1200),
+            "strength_attack_away":  t.get("strength_attack_away", 1200),
+            "strength_defence_home": t.get("strength_defence_home", 1200),
+            "strength_defence_away": t.get("strength_defence_away", 1200),
+        }
+        for t in fpl_teams
+    ]
+
+    strength_map = {t["id"]: t for t in teams}
+
+    def _fdr(strength_val, all_vals):
+        if not all_vals or not strength_val:
+            return 3
+        avg = sum(all_vals) / len(all_vals)
+        ratio = strength_val / avg
+        if ratio < 0.87: return 2
+        if ratio < 0.97: return 3
+        if ratio < 1.07: return 3
+        if ratio < 1.17: return 4
+        return 5
+
+    all_atk   = [t["strength_attack_away"]  for t in teams if t["strength_attack_away"]]
+    all_def   = [t["strength_defence_away"] for t in teams if t["strength_defence_away"]]
+    all_atk_h = [t["strength_attack_home"]  for t in teams if t["strength_attack_home"]]
+    all_def_h = [t["strength_defence_home"] for t in teams if t["strength_defence_home"]]
+
+    fixtures = []
+    for r in fixture_rows:
+        gw, team_h_id, team_a_id, kickoff = r
+        opp_h = strength_map.get(team_a_id, {})
+        opp_a = strength_map.get(team_h_id, {})
+        fixtures.append({
+            "gw":               gw,
+            "team_h":           team_h_id,
+            "team_a":           team_a_id,
+            "kickoff_time":     str(kickoff) if kickoff else None,
+            "team_h_attack_fdr":  _fdr(opp_h.get("strength_attack_away"), all_atk),
+            "team_h_defence_fdr": _fdr(opp_h.get("strength_defence_away"), all_def),
+            "team_a_attack_fdr":  _fdr(opp_a.get("strength_attack_home"), all_atk_h),
+            "team_a_defence_fdr": _fdr(opp_a.get("strength_defence_home"), all_def_h),
+        })
+
+    return {
+        "current_gw": current_gw,
+        "teams":      teams,
+        "fixtures":   fixtures,
+    }
+
+
+# ---------------------------------------------------------------------------
+# All-time H2H
 # ---------------------------------------------------------------------------
 
 @router.get("/alltime/h2h")
@@ -1220,7 +1238,7 @@ def get_alltime_h2h():
                     COUNT(*) FILTER (WHERE s.result = 'w') AS wins,
                     COUNT(*) FILTER (WHERE s.result = 'd') AS draws,
                     COUNT(*) FILTER (WHERE s.result = 'l') AS losses,
-                    SUM(s.points_for)    AS points_for,
+                    SUM(s.points_for)     AS points_for,
                     SUM(s.points_against) AS points_against
                 FROM standings s
                 JOIN fantasy_teams t1
@@ -1256,7 +1274,6 @@ def get_alltime_records():
     """All-time highs and lows across all seasons."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-
             cur.execute("""
                 SELECT ft.player_first_name, s.gw, se.name, s.points_for
                 FROM standings s
@@ -1294,7 +1311,6 @@ def get_alltime_records():
             """)
             margin = cur.fetchone()
 
-            # Historic league finishes per manager per season
             cur.execute("""
                 SELECT
                     ft.player_first_name,
@@ -1343,161 +1359,6 @@ def get_alltime_records():
 
 
 # ---------------------------------------------------------------------------
-# GW lineup for a specific team + gameweek (for expandable results)
-# ---------------------------------------------------------------------------
-
-@router.get("/season/{season_id}/lineup/{team_id}/{gw}")
-def get_gw_lineup(season_id: int, team_id: int, gw: int):
-    """Returns starters and bench for a team in a specific GW with points."""
-    _season_or_404(season_id)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    gl.position,
-                    gl.is_captain,
-                    gl.is_vice_captain,
-                    gl.multiplier,
-                    p.first_name || ' ' || p.second_name AS player_name,
-                    p.web_name,
-                    p.id AS player_id,
-                    et.singular_name_short AS pos,
-                    COALESCE(pgs.total_points, 0) AS points,
-                    COALESCE(pgs.minutes, 0)       AS minutes,
-                    COALESCE(pgs.goals, 0)         AS goals,
-                    COALESCE(pgs.assists, 0)       AS assists,
-                    COALESCE(pgs.bonus, 0)         AS bonus
-                FROM gameweek_lineups gl
-                JOIN players p ON p.id = gl.player_id
-                JOIN element_type et ON et.id = p.position
-                LEFT JOIN player_gameweek_stats pgs
-                    ON pgs.player_id = gl.player_id
-                    AND pgs.season_id = gl.season_id
-                    AND pgs.gw = gl.gw
-                WHERE gl.season_id = %s
-                    AND gl.team_id = %s
-                    AND gl.gw = %s
-                ORDER BY gl.position;
-            """, (season_id, team_id, gw))
-            rows = cur.fetchall()
-
-    picks = [
-        {
-            "position":        r[0],
-            "is_captain":      r[1],
-            "is_vice_captain": r[2],
-            "multiplier":      r[3],
-            "player_name":     r[4],
-            "web_name":        r[5],
-            "player_id":       r[6],
-            "pos":             r[7],
-            "points":          r[8],
-            "minutes":         r[9],
-            "goals":           r[10],
-            "assists":         r[11],
-            "bonus":           r[12],
-        }
-        for r in rows
-    ]
-
-    return {
-        "starters": [p for p in picks if p["position"] <= 11],
-        "bench":    [p for p in picks if p["position"] > 11],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Fixtures upcoming — for fixture difficulty grid
-# Uses FPL main bootstrap for attack/defence split FDR
-# ---------------------------------------------------------------------------
-
-@router.get("/season/{season_id}/fixtures-upcoming")
-def get_fixtures_upcoming(season_id: int):
-    """Returns upcoming fixtures with attack/defence FDR from FPL main bootstrap."""
-    from fpl_client import fetch_fpl_bootstrap, fetch_fixtures
-    _season_or_404(season_id)
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COALESCE(MAX(gw), 1) FROM player_gameweek_stats
-                WHERE season_id = %s;
-            """, (season_id,))
-            current_gw = cur.fetchone()[0]
-
-            cur.execute("""
-                SELECT f.gw, f.team_h, f.team_a, f.kickoff_time
-                FROM fixtures f
-                WHERE f.season_id = %s AND f.gw >= %s AND f.gw <= %s
-                ORDER BY f.gw, f.kickoff_time;
-            """, (season_id, current_gw, current_gw + 6))
-            fixture_rows = cur.fetchall()
-
-    # Pull live team strength data from FPL main bootstrap
-    try:
-        bootstrap  = fetch_fpl_bootstrap()
-        fpl_teams  = bootstrap.get("teams", [])
-    except Exception:
-        fpl_teams  = []
-
-    teams = [
-        {
-            "id":                    t["id"],
-            "name":                  t["name"],
-            "short_name":            t["short_name"],
-            "strength_overall_home": t.get("strength_overall_home", 1200),
-            "strength_overall_away": t.get("strength_overall_away", 1200),
-            "strength_attack_home":  t.get("strength_attack_home", 1200),
-            "strength_attack_away":  t.get("strength_attack_away", 1200),
-            "strength_defence_home": t.get("strength_defence_home", 1200),
-            "strength_defence_away": t.get("strength_defence_away", 1200),
-        }
-        for t in fpl_teams
-    ]
-
-    strength_map = {t["id"]: t for t in teams}
-
-    def _fdr(strength_val, all_vals):
-        """Convert raw strength to 1-5 FDR scale."""
-        if not all_vals or not strength_val: return 3
-        avg = sum(all_vals) / len(all_vals)
-        ratio = strength_val / avg
-        if ratio < 0.87: return 2
-        if ratio < 0.97: return 3
-        if ratio < 1.07: return 3
-        if ratio < 1.17: return 4
-        return 5
-
-    all_atk   = [t["strength_attack_away"]  for t in teams if t["strength_attack_away"]]
-    all_def   = [t["strength_defence_away"] for t in teams if t["strength_defence_away"]]
-    all_atk_h = [t["strength_attack_home"]  for t in teams if t["strength_attack_home"]]
-    all_def_h = [t["strength_defence_home"] for t in teams if t["strength_defence_home"]]
-
-    fixtures = []
-    for r in fixture_rows:
-        gw, team_h_id, team_a_id, kickoff = r
-        opp_h = strength_map.get(team_a_id, {})
-        opp_a = strength_map.get(team_h_id, {})
-
-        fixtures.append({
-            "gw":           gw,
-            "team_h":       team_h_id,
-            "team_a":       team_a_id,
-            "kickoff_time": str(kickoff) if kickoff else None,
-            "team_h_attack_fdr":  _fdr(opp_h.get("strength_attack_away"), all_atk),
-            "team_h_defence_fdr": _fdr(opp_h.get("strength_defence_away"), all_def),
-            "team_a_attack_fdr":  _fdr(opp_a.get("strength_attack_home"), all_atk_h),
-            "team_a_defence_fdr": _fdr(opp_a.get("strength_defence_home"), all_def_h),
-        })
-
-    return {
-        "current_gw": current_gw,
-        "teams":      teams,
-        "fixtures":   fixtures,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Player historical season stats (from element-summary)
 # ---------------------------------------------------------------------------
 
@@ -1524,7 +1385,10 @@ def get_player_history(player_id: int):
             """, (player_id,))
             current = cur.fetchone()
 
-            cur.execute("SELECT first_name, second_name, web_name FROM players WHERE id = %s", (player_id,))
+            cur.execute(
+                "SELECT first_name, second_name, web_name FROM players WHERE id = %s",
+                (player_id,)
+            )
             player = cur.fetchone()
 
     history = [
@@ -1546,10 +1410,10 @@ def get_player_history(player_id: int):
     ]
 
     return {
-        "player_id":   player_id,
-        "name":        f"{player[0]} {player[1]}" if player else "Unknown",
-        "web_name":    player[2] if player else "Unknown",
-        "history":     history,
+        "player_id": player_id,
+        "name":      f"{player[0]} {player[1]}" if player else "Unknown",
+        "web_name":  player[2] if player else "Unknown",
+        "history":   history,
         "current_season": {
             "total_points": current[0] or 0,
             "minutes":      current[1] or 0,
@@ -1558,5 +1422,286 @@ def get_player_history(player_id: int):
             "clean_sheets": current[4] or 0,
             "bonus":        current[5] or 0,
             "saves":        current[6] or 0,
-        } if current else None
+        } if current else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Player drill-through — full profile with history, GW stats, ownership
+# ---------------------------------------------------------------------------
+
+@router.get("/player/{player_id}/drill")
+def get_player_drill(player_id: int):
+    """
+    Full drill-through for a player:
+    - Basic info (name, position, team, flags)
+    - Historic season totals (from player_season_history)
+    - Per-GW stats per season — primary: player_gameweek_stats,
+      fallback: player_fixture_history (for seasons without GW syncs)
+    - Ownership history from player_ownership_history (draft + transactions)
+    - Fixture history vs each real PL opponent (from player_fixture_history)
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Player meta from most recent season
+            cur.execute("""
+                SELECT
+                    p.id, p.first_name, p.second_name, p.web_name,
+                    et.singular_name_short AS position,
+                    plt.name               AS pl_team_full,
+                    plt.short_name         AS pl_team,
+                    p.status, p.news,
+                    p.chance_of_playing_next_round
+                FROM players p
+                JOIN element_type et ON et.id = p.position
+                JOIN premier_league_teams plt
+                    ON plt.id = p.team AND plt.season_id = p.season_id
+                WHERE p.id = %s
+                ORDER BY p.season_id DESC
+                LIMIT 1;
+            """, (player_id,))
+            meta = cur.fetchone()
+
+            if not meta:
+                raise HTTPException(status_code=404, detail=f"Player {player_id} not found")
+
+            # Historical season totals
+            cur.execute("""
+                SELECT season_name, total_points, minutes, goals_scored, assists,
+                       clean_sheets, bonus, saves, yellow_cards, red_cards,
+                       start_cost, end_cost
+                FROM player_season_history
+                WHERE player_id = %s
+                ORDER BY season_name DESC;
+            """, (player_id,))
+            season_history = cur.fetchall()
+
+            # GW stats — primary source (player_gameweek_stats)
+            cur.execute("""
+                SELECT
+                    se.name    AS season_name,
+                    pgs.season_id,
+                    pgs.gw,
+                    pgs.total_points,
+                    pgs.goals,
+                    pgs.assists,
+                    pgs.clean_sheets,
+                    pgs.bonus,
+                    pgs.saves,
+                    pgs.minutes,
+                    pgs.yellow_cards,
+                    pgs.red_cards,
+                    pgs.defensive_contribution
+                FROM player_gameweek_stats pgs
+                JOIN seasons se ON se.id = pgs.season_id
+                WHERE pgs.player_id = %s
+                ORDER BY pgs.season_id DESC, pgs.gw ASC;
+            """, (player_id,))
+            gw_stats_primary = cur.fetchall()
+
+            # GW stats — fallback source (player_fixture_history grouped by season + GW)
+            cur.execute("""
+                SELECT
+                    pfh.season_name,
+                    pfh.gw,
+                    SUM(pfh.total_points)   AS total_points,
+                    SUM(pfh.goals_scored)   AS goals,
+                    SUM(pfh.assists)        AS assists,
+                    SUM(pfh.clean_sheets)   AS clean_sheets,
+                    SUM(pfh.bonus)          AS bonus,
+                    SUM(pfh.saves)          AS saves,
+                    SUM(pfh.minutes)        AS minutes,
+                    SUM(pfh.yellow_cards)   AS yellow_cards,
+                    SUM(pfh.red_cards)      AS red_cards
+                FROM player_fixture_history pfh
+                WHERE pfh.player_id = %s
+                GROUP BY pfh.season_name, pfh.gw
+                ORDER BY pfh.season_name DESC, pfh.gw ASC;
+            """, (player_id,))
+            gw_stats_fallback = cur.fetchall()
+
+            # Ownership history — from player_ownership_history (draft + transactions)
+            cur.execute("""
+                SELECT
+                    se.name               AS season_name,
+                    poh.season_id,
+                    poh.from_gw,
+                    poh.to_gw,
+                    ft.player_first_name  AS owner,
+                    ft.team_name,
+                    ft.internal_team_id   AS team_id
+                FROM player_ownership_history poh
+                JOIN fantasy_teams ft
+                    ON ft.id = poh.team_id AND ft.season_id = poh.season_id
+                JOIN seasons se ON se.id = poh.season_id
+                WHERE poh.player_id = %s
+                ORDER BY poh.season_id DESC, poh.from_gw ASC;
+            """, (player_id,))
+            ownership_rows = cur.fetchall()
+
+            # Fixture-level history vs each PL opponent
+            cur.execute("""
+                SELECT
+                    pfh.opponent_team,
+                    plt.name               AS opponent_full,
+                    plt.short_name         AS opponent_short,
+                    pfh.was_home,
+                    pfh.kickoff_time,
+                    pfh.total_points,
+                    pfh.goals_scored,
+                    pfh.assists,
+                    pfh.clean_sheets,
+                    pfh.saves,
+                    pfh.bonus,
+                    pfh.minutes,
+                    pfh.yellow_cards,
+                    pfh.red_cards,
+                    pfh.value,
+                    pfh.gw
+                FROM player_fixture_history pfh
+                LEFT JOIN premier_league_teams plt
+                    ON plt.id = pfh.opponent_team
+                WHERE pfh.player_id = %s
+                ORDER BY pfh.kickoff_time DESC;
+            """, (player_id,))
+            fixture_history = cur.fetchall()
+
+    # Merge GW stats: primary where available, fallback for other seasons
+    primary_seasons = set(r[0] for r in gw_stats_primary)
+
+    gw_stats = [
+        {
+            "season_name":            r[0],
+            "season_id":              r[1],
+            "gw":                     r[2],
+            "total_points":           r[3],
+            "goals":                  r[4],
+            "assists":                r[5],
+            "clean_sheets":           r[6],
+            "bonus":                  r[7],
+            "saves":                  r[8],
+            "minutes":                r[9],
+            "yellow_cards":           r[10],
+            "red_cards":              r[11],
+            "defensive_contribution": r[12],
+        }
+        for r in gw_stats_primary
+    ]
+
+    for r in gw_stats_fallback:
+        if r[0] not in primary_seasons:
+            gw_stats.append({
+                "season_name":            r[0],
+                "season_id":              None,
+                "gw":                     r[1],
+                "total_points":           r[2],
+                "goals":                  r[3],
+                "assists":                r[4],
+                "clean_sheets":           r[5],
+                "bonus":                  r[6],
+                "saves":                  r[7],
+                "minutes":                r[8],
+                "yellow_cards":           r[9],
+                "red_cards":              r[10],
+                "defensive_contribution": 0,
+            })
+
+    # Sort: most recent season first, GW ascending within season
+    gw_stats.sort(key=lambda x: (x["season_name"], x["gw"]))
+    gw_stats.sort(key=lambda x: x["season_name"], reverse=True)
+
+    # Aggregate per-opponent stats
+    opponent_agg = {}
+    for r in fixture_history:
+        opp_id = r[0]
+        if opp_id not in opponent_agg:
+            opponent_agg[opp_id] = {
+                "opponent_id":    opp_id,
+                "opponent_full":  r[1] or f"Team {opp_id}",
+                "opponent_short": r[2] or "???",
+                "appearances":    0,
+                "total_points":   0,
+                "goals":          0,
+                "assists":        0,
+                "clean_sheets":   0,
+                "bonus":          0,
+                "minutes":        0,
+            }
+        ag = opponent_agg[opp_id]
+        ag["appearances"]  += 1
+        ag["total_points"] += r[5] or 0
+        ag["goals"]        += r[6] or 0
+        ag["assists"]      += r[7] or 0
+        ag["clean_sheets"] += r[8] or 0
+        ag["bonus"]        += r[10] or 0
+        ag["minutes"]      += r[11] or 0
+
+    return {
+        "player": {
+            "id":                           meta[0],
+            "name":                         f"{meta[1]} {meta[2]}",
+            "web_name":                     meta[3],
+            "position":                     meta[4],
+            "pl_team_full":                 meta[5],
+            "pl_team":                      meta[6],
+            "status":                       meta[7],
+            "news":                         meta[8],
+            "chance_of_playing_next_round": meta[9],
+        },
+        "season_history": [
+            {
+                "season":       r[0],
+                "total_points": r[1],
+                "minutes":      r[2],
+                "goals":        r[3],
+                "assists":      r[4],
+                "clean_sheets": r[5],
+                "bonus":        r[6],
+                "saves":        r[7],
+                "yellow_cards": r[8],
+                "red_cards":    r[9],
+                "start_cost":   r[10] / 10 if r[10] else None,
+                "end_cost":     r[11] / 10 if r[11] else None,
+            }
+            for r in season_history
+        ],
+        "gw_stats": gw_stats,
+        "ownership_history": [
+            {
+                "season_name": r[0],
+                "season_id":   r[1],
+                "from_gw":     r[2],
+                "to_gw":       r[3],
+                "owner":       r[4],
+                "team_name":   r[5],
+                "team_id":     r[6],
+            }
+            for r in ownership_rows
+        ],
+        "fixture_history": [
+            {
+                "opponent_id":    r[0],
+                "opponent_full":  r[1] or f"Team {r[0]}",
+                "opponent_short": r[2] or "???",
+                "was_home":       r[3],
+                "kickoff_time":   str(r[4]) if r[4] else None,
+                "total_points":   r[5],
+                "goals":          r[6],
+                "assists":        r[7],
+                "clean_sheets":   r[8],
+                "saves":          r[9],
+                "bonus":          r[10],
+                "minutes":        r[11],
+                "yellow_cards":   r[12],
+                "red_cards":      r[13],
+                "value":          r[14] / 10 if r[14] else None,
+                "round":          r[15],
+            }
+            for r in fixture_history
+        ],
+        "vs_opponents": sorted(
+            list(opponent_agg.values()),
+            key=lambda x: x["total_points"],
+            reverse=True,
+        ),
     }
