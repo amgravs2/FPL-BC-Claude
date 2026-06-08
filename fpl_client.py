@@ -57,3 +57,8 @@ def fetch_fixtures() -> list:
 def fetch_draft_choices(league_id: int) -> dict:
     """Draft pick order for the league."""
     return _get(f"{DRAFT_BASE}/draft/{league_id}/choices")
+
+
+def fetch_element_summary(element_id: int) -> dict:
+    """Per-fixture history and historical season stats for a player."""
+    return _get(f"{FPL_BASE}/element-summary/{element_id}/")
