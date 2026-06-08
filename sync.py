@@ -302,8 +302,84 @@ def sync_bootstrap(season_id: int) -> dict:
                 """, (gw1_deadline.date(), gw38_deadline.date(), season_id))
                 counts["season_dates_updated"] = cur.rowcount
 
+        # ── Inside sync_bootstrap, after the players upsert block ────────────────────
+ 
+            # 5. player_status_history — snapshot any status/news changes
+            #
+            # Strategy: for each player in the bootstrap, compare current
+            # status/news/chance against the most recent snapshot we have.
+            # Only insert a new row if something actually changed (or if
+            # this is the first snapshot for that player this season).
+            #
+            # We do this in Python to avoid a large per-row SQL round-trip.
+ 
+            # Fetch the latest known snapshot for every player in this season.
+            cur.execute("""
+                SELECT DISTINCT ON (player_id)
+                    player_id,
+                    status,
+                    news,
+                    chance_of_playing_next_round,
+                    chance_of_playing_this_round
+                FROM player_status_history
+                WHERE season_id = %s
+                ORDER BY player_id, snapped_at DESC;
+            """, (season_id,))
+            existing_snapshots = {
+                row[0]: {
+                    "status":  row[1],
+                    "news":    row[2],
+                    "cop_next": row[3],
+                    "cop_this": row[4],
+                }
+                for row in cur.fetchall()
+            }
+ 
+            snapshot_records = []
+            for p in data.get("elements", []):
+                pid        = p.get("id")
+                new_status = p.get("status")
+                new_news   = p.get("news") or None   # normalise "" → None
+                new_next   = p.get("chance_of_playing_next_round")
+                new_this   = p.get("chance_of_playing_this_round")
+ 
+                prev = existing_snapshots.get(pid)
+                changed = (
+                    prev is None                        # first snapshot ever
+                    or prev["status"]   != new_status
+                    or prev["news"]     != new_news
+                    or prev["cop_next"] != new_next
+                    or prev["cop_this"] != new_this
+                )
+ 
+                if changed:
+                    snapshot_records.append((
+                        pid,
+                        season_id,
+                        # gw = current event at time of sync
+                        current_id,
+                        new_status,
+                        new_news,
+                        p.get("news_added"),
+                        new_next,
+                        new_this,
+                    ))
+ 
+            if snapshot_records:
+                execute_values(cur, """
+                    INSERT INTO player_status_history (
+                        player_id, season_id, gw,
+                        status, news, news_added,
+                        chance_of_playing_next_round,
+                        chance_of_playing_this_round
+                    ) VALUES %s
+                    ON CONFLICT (player_id, season_id, snapped_at) DO NOTHING;
+                """, snapshot_records)
+ 
+            counts["status_snapshots"] = len(snapshot_records)
+ 
         conn.commit()
-
+ 
     return counts
 
 
