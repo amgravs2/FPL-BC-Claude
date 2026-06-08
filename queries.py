@@ -791,7 +791,14 @@ def get_player_stats(season_id: int):
                     COALESCE(SUM(pgs.yellow_cards), 0)      AS yellow_cards,
                     COALESCE(SUM(pgs.red_cards), 0)         AS red_cards,
                     COALESCE(SUM(pgs.goals_conceded), 0)    AS goals_conceded,
-                    COALESCE(SUM(pgs.defensive_contribution), 0) AS defensive_contribution,
+                    -- DC: from GW live stats if available, else from fixture history
+                    COALESCE(
+                        NULLIF(COALESCE(SUM(pgs.defensive_contribution), 0), 0),
+                        (SELECT COALESCE(SUM(pfh2.defensive_contribution), 0)
+                         FROM player_fixture_history pfh2
+                         JOIN seasons se2 ON se2.name = pfh2.season_name
+                         WHERE pfh2.player_id = p.id AND se2.id = %s)
+                    ) AS defensive_contribution,
                     COUNT(CASE WHEN pgs.minutes = 0 THEN 1 END) AS blank_gws,
                     -- Average pts over last 5 GWs (subquery keyed on player + season)
                     COALESCE((
@@ -832,7 +839,7 @@ def get_player_stats(season_id: int):
                     ft.internal_team_id IS NOT NULL
                     OR COALESCE(SUM(pgs.total_points), 0) > 0
                 ORDER BY total_points DESC;
-            """, (season_id, season_id, season_id, season_id, season_id, season_id))
+            """, (season_id, season_id, season_id, season_id, season_id, season_id, season_id))
             rows = cur.fetchall()
 
     return [
@@ -855,14 +862,15 @@ def get_player_stats(season_id: int):
             "goals_conceded":               r[15],
             "defensive_contribution":       r[16],
             "blank_gws":                    r[17],
-            "owner":                        r[18],
-            "owner_team_id":                r[19],
-            "status":                       r[20],
-            "news":                         r[21],
-            "chance_of_playing_next_round": r[22],
-            "chance_of_playing_this_round": r[23],
-            "pl_team_id":                   r[24],
-            "avg_pts_5gw":                  float(r[25]) if r[25] else 0,
+            # r[18] = avg_pts_5gw (subquery inserted here in SELECT)
+            "owner":                        r[19],
+            "owner_team_id":                r[20],
+            "status":                       r[21],
+            "news":                         r[22],
+            "chance_of_playing_next_round": r[23],
+            "chance_of_playing_this_round": r[24],
+            "pl_team_id":                   r[25],
+            "avg_pts_5gw":                  float(r[18]) if r[18] else 0,
         }
         for r in rows
     ]
