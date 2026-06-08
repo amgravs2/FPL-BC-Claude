@@ -903,7 +903,12 @@ def get_player_gw_stats(season_id: int, player_id: int):
                     pgs.yellow_cards,
                     pgs.red_cards,
                     pgs.goals_conceded,
-                    pgs.defensive_contribution,
+                    -- DC: prefer player_fixture_history (backfilled by element-summaries)
+                    -- over player_gameweek_stats (only non-zero if /sync/stats/{gw} was run)
+                    COALESCE(
+                        NULLIF(pfh.defensive_contribution, 0),
+                        pgs.defensive_contribution
+                    ) AS defensive_contribution,
                     COALESCE(pgs.expected_goals, 0)   AS xg,
                     COALESCE(pgs.expected_assists, 0) AS xa,
                     pgs.bps,
