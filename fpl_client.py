@@ -62,3 +62,8 @@ def fetch_draft_choices(league_id: int) -> dict:
 def fetch_element_summary(element_id: int) -> dict:
     """Per-fixture history and historical season stats for a player."""
     return _get(f"{FPL_BASE}/element-summary/{element_id}/")
+
+
+def fetch_fpl_bootstrap() -> dict:
+    """FPL main bootstrap — richer team strength data (attack/defence split)."""
+    return _get(f"{FPL_BASE}/bootstrap-static/")
