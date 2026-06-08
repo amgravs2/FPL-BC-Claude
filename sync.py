@@ -791,12 +791,16 @@ def sync_element_summaries(season_id: int) -> dict:
                     _int(fix.get("penalties_missed")),
                     _int(fix.get("yellow_cards")),
                     _int(fix.get("red_cards")),
-                    _int(fix.get("saves")),
                     _int(fix.get("bonus")),
                     _int(fix.get("bps")),
                     _int(fix.get("total_points")),
                     _int(fix.get("value")),
                     current_season_name,  # use DB name, not a hardcoded string
+                    _int(fix.get("saves")),
+                    _int(fix.get("defensive_contribution")),
+                    _int(fix.get("clearances_blocks_interceptions")),
+                    _int(fix.get("recoveries")),
+                    _int(fix.get("tackles")),
                 ))
 
             # Historical season totals (history_past has correct season_name e.g. "2023/24")
@@ -840,15 +844,22 @@ def sync_element_summaries(season_id: int) -> dict:
                         player_id, fixture_id, gw, opponent_team, was_home,
                         kickoff_time, minutes, goals_scored, assists, clean_sheets,
                         goals_conceded, own_goals, penalties_saved, penalties_missed,
-                        yellow_cards, red_cards, saves, bonus, bps, total_points,
-                        value, season_name
+                        yellow_cards, red_cards, bonus, bps, total_points,
+                        value, season_name,
+                        saves, defensive_contribution,
+                        clearances_blocks_interceptions, recoveries, tackles
                     ) VALUES %s
                     ON CONFLICT (player_id, fixture_id) DO UPDATE SET
-                        total_points = EXCLUDED.total_points,
-                        bonus        = EXCLUDED.bonus,
-                        bps          = EXCLUDED.bps,
-                        value        = EXCLUDED.value,
-                        season_name  = EXCLUDED.season_name;
+                        total_points                    = EXCLUDED.total_points,
+                        bonus                           = EXCLUDED.bonus,
+                        bps                             = EXCLUDED.bps,
+                        value                           = EXCLUDED.value,
+                        season_name                     = EXCLUDED.season_name,
+                        saves                           = EXCLUDED.saves,
+                        defensive_contribution          = EXCLUDED.defensive_contribution,
+                        clearances_blocks_interceptions = EXCLUDED.clearances_blocks_interceptions,
+                        recoveries                      = EXCLUDED.recoveries,
+                        tackles                         = EXCLUDED.tackles;
                 """, fixture_records)
 
             if season_records:
