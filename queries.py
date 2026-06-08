@@ -1130,12 +1130,12 @@ def get_player_ownership(season_id: int, player_id: int):
 # TRANSFER ANALYTICS  (replace the existing get_transfer_analytics function
 # and add get_transfer_stats below it in queries.py)
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 @router.get("/season/{season_id}/transfers")
 def get_transfer_analytics(season_id: int):
     """
     Transfer activity per manager with post-transfer point delta.
-
+ 
     Now includes:
       - position (singular_name_short) and pl_team short_name for BOTH players
       - Player injury snapshot at the time we serve the data:
@@ -1145,7 +1145,7 @@ def get_transfer_analytics(season_id: int):
         GW onwards, so the frontend can draw the head-to-head chart.
     """
     _season_or_404(season_id)
-
+ 
     with get_conn() as conn:
         with conn.cursor() as cur:
             # ── 1. Core transfer rows with position + team enrichment ──────────
@@ -1161,6 +1161,8 @@ def get_transfer_analytics(season_id: int):
                         tx.result,
                         p_in.first_name  || ' ' || p_in.second_name  AS player_in,
                         p_out.first_name || ' ' || p_out.second_name AS player_out,
+                        p_in.web_name                                AS web_name_in,
+                        p_out.web_name                               AS web_name_out,
                         tx.player_in_id,
                         tx.player_out_id,
                         -- Position (element_type)
@@ -1215,11 +1217,12 @@ def get_transfer_analytics(season_id: int):
                 ORDER BY gw DESC, id DESC;
             """, (season_id,))
             rows = cur.fetchall()
-
+ 
             col_names = [
                 "id", "manager", "fantasy_team_id", "internal_team_id",
                 "gw", "kind", "result",
                 "player_in", "player_out",
+                "web_name_in", "web_name_out",
                 "player_in_id", "player_out_id",
                 "pos_in", "pos_out",
                 "team_in", "team_out",
@@ -1228,13 +1231,13 @@ def get_transfer_analytics(season_id: int):
                 "points_in_after", "points_out_after", "delta",
             ]
             transfers_raw = [dict(zip(col_names, r)) for r in rows]
-
+ 
             # ── 2. Per-GW points for every player that appears in a transfer ──
             player_ids = set()
             for t in transfers_raw:
                 player_ids.add(t["player_in_id"])
                 player_ids.add(t["player_out_id"])
-
+ 
             gw_pts: dict = {}   # {player_id: {gw: pts}}
             if player_ids:
                 cur.execute("""
@@ -1245,27 +1248,27 @@ def get_transfer_analytics(season_id: int):
                 """, (season_id, list(player_ids)))
                 for pid, gw, pts in cur.fetchall():
                     gw_pts.setdefault(pid, {})[gw] = pts
-
+ 
     # ── 3. Attach per-GW chart data to each transfer ──────────────────────────
     # Build {gw: {in: pts, out: pts}} from transfer_gw to max_gw
     all_gws_seen: set = set()
     for pid_map in gw_pts.values():
         all_gws_seen.update(pid_map.keys())
     max_gw = max(all_gws_seen) if all_gws_seen else 1
-
+ 
     transfers = []
     for t in transfers_raw:
         in_id  = t["player_in_id"]
         out_id = t["player_out_id"]
         start  = t["gw"] + 1          # chart starts GW after transfer
-
+ 
         chart = {}
         for gw in range(start, max_gw + 1):
             chart[gw] = {
                 "in":  gw_pts.get(in_id,  {}).get(gw, 0),
                 "out": gw_pts.get(out_id, {}).get(gw, 0),
             }
-
+ 
         # Flag snapshot: has a flag if chance_of_playing ≤ 75 or status not 'a'
         def _flag(status, news, cop_next, cop_this):
             if status and status != "a":
@@ -1274,14 +1277,14 @@ def get_transfer_analytics(season_id: int):
             if cop is not None and cop <= 75:
                 return {"level": f"{cop}%", "news": news}
             return None
-
+ 
         transfers.append({
             **{k: t[k] for k in col_names},
             "chart_gw_points": chart,   # {gw: {in, out}}
             "flag_in":  _flag(t["status_in"],  t["news_in"],  t["cop_next_in"],  t["cop_this_in"]),
             "flag_out": _flag(t["status_out"], t["news_out"], t["cop_next_out"], t["cop_this_out"]),
         })
-
+ 
     # ── 4. Per-manager summary ────────────────────────────────────────────────
     managers: dict = {}
     for t in transfers:
@@ -1301,27 +1304,27 @@ def get_transfer_analytics(season_id: int):
             managers[m]["best_transfer"] = t
         if managers[m]["worst_transfer"] is None or t["delta"] < managers[m]["worst_transfer"]["delta"]:
             managers[m]["worst_transfer"] = t
-
+ 
     # Sort transfers by delta for best/worst overall
     by_delta = sorted(transfers, key=lambda x: x["delta"], reverse=True)
-
+ 
     return {
         "all_transfers":   transfers,       # already sorted GW desc
         "best_transfer":   by_delta[0]  if by_delta else None,
         "worst_transfer":  by_delta[-1] if by_delta else None,
         "manager_summary": list(managers.values()),
     }
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRANSFER STATS PAGE  (new endpoint — add after get_transfer_analytics)
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 @router.get("/season/{season_id}/transfer-stats")
 def get_transfer_stats(season_id: int):
     """
     Aggregated transfer analytics for the Transfer Stats page.
-
+ 
     Returns:
       - by_position          : count IN/OUT per position
       - by_team_in / by_team_out : count per PL team split by attack (MID+FWD) / defense (GKP+DEF)
@@ -1330,10 +1333,10 @@ def get_transfer_stats(season_id: int):
       - busiest_gw           : the GW with most transfers
     """
     _season_or_404(season_id)
-
+ 
     with get_conn() as conn:
         with conn.cursor() as cur:
-
+ 
             # ── Position breakdown ──────────────────────────────────────────
             cur.execute("""
                 SELECT
@@ -1358,7 +1361,7 @@ def get_transfer_stats(season_id: int):
                 ORDER BY position, direction;
             """, (season_id, season_id))
             pos_rows = cur.fetchall()
-
+ 
             # ── Team breakdown ──────────────────────────────────────────────
             # Classify MID+FWD as 'attack', GKP+DEF as 'defense'
             cur.execute("""
@@ -1392,7 +1395,7 @@ def get_transfer_stats(season_id: int):
                 ORDER BY pl_team, direction;
             """, (season_id, season_id))
             team_rows = cur.fetchall()
-
+ 
             # ── Per-manager count ───────────────────────────────────────────
             cur.execute("""
                 SELECT
@@ -1407,7 +1410,7 @@ def get_transfer_stats(season_id: int):
                 ORDER BY cnt DESC;
             """, (season_id,))
             mgr_rows = cur.fetchall()
-
+ 
             # ── Per-GW count ────────────────────────────────────────────────
             cur.execute("""
                 SELECT gw, COUNT(*) AS cnt
@@ -1417,12 +1420,12 @@ def get_transfer_stats(season_id: int):
                 ORDER BY gw;
             """, (season_id,))
             gw_rows = cur.fetchall()
-
+ 
     # Reshape position data: {GKP: {in: N, out: N}, ...}
     pos_map: dict = {}
     for pos, direction, cnt in pos_rows:
         pos_map.setdefault(pos, {"in": 0, "out": 0})[direction] = cnt
-
+ 
     # Reshape team data: {MAN: {in: {attack: N, defense: N}, out: {...}}, ...}
     team_map: dict = {}
     for pl_team, direction, group_type, cnt in team_rows:
@@ -1432,10 +1435,10 @@ def get_transfer_stats(season_id: int):
         })
         team_map[pl_team][direction][group_type] += cnt
         team_map[pl_team][direction]["total"]    += cnt
-
+ 
     by_gw = [{"gw": r[0], "count": r[1]} for r in gw_rows]
     busiest = max(by_gw, key=lambda x: x["count"]) if by_gw else None
-
+ 
     return {
         "by_position": [
             {"position": pos, **counts}
