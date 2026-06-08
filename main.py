@@ -1,6 +1,6 @@
 import logging
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Query
 from contextlib import asynccontextmanager
 
 from db import get_active_season_id
@@ -17,12 +17,31 @@ from sync import (
     sync_standings,
     sync_draft_picks,
     sync_element_summaries,
-    sync_pl_team_records,       # NEW
-    sync_ownership_from_draft,  # NEW
+    sync_all_element_summaries,
+    sync_pl_team_records,
+    sync_ownership_from_draft,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Job status tracker — in-memory, resets on restart
+# ---------------------------------------------------------------------------
+_job_status: dict = {}
+
+
+def _run_background_sync(job_id: str, fn, *args):
+    """Wrapper that updates job status around a sync function."""
+    _job_status[job_id] = {"status": "running", "result": None, "error": None}
+    try:
+        result = fn(*args)
+        _job_status[job_id] = {"status": "done", "result": result, "error": None}
+        logger.info(f"Background job {job_id} complete: {result}")
+    except Exception as e:
+        _job_status[job_id] = {"status": "error", "result": None, "error": str(e)}
+        logger.error(f"Background job {job_id} failed: {e}")
 
 
 @asynccontextmanager
@@ -57,6 +76,14 @@ def health():
     return {"status": "ok", "active_season_id": season_id}
 
 
+@app.get("/sync/job/{job_id}", tags=["sync"])
+def get_job_status(job_id: str):
+    """Poll the status of a background sync job."""
+    if job_id not in _job_status:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
+    return {"job_id": job_id, **_job_status[job_id]}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -73,16 +100,11 @@ def _resolve_season(season_id: int | None) -> int:
 
 # ---------------------------------------------------------------------------
 # Sync routes
-# Each returns a count summary so you can confirm what landed.
 # ---------------------------------------------------------------------------
 
 @app.post("/sync/bootstrap", tags=["sync"])
 def route_sync_bootstrap(season_id: int | None = Query(default=None)):
-    """
-    Syncs: element_types, premier_league_teams, players, gameweeks.
-    Also derives and saves season start/end dates from GW1 and GW38 deadlines.
-    Run this first on a fresh DB, then daily.
-    """
+    """Syncs element_types, premier_league_teams, players, gameweeks."""
     sid = _resolve_season(season_id)
     result = sync_bootstrap(sid)
     return {"season_id": sid, "synced": result}
@@ -106,7 +128,7 @@ def route_sync_matches(season_id: int | None = Query(default=None)):
 
 @app.post("/sync/player-status", tags=["sync"])
 def route_sync_player_status(season_id: int | None = Query(default=None)):
-    """Syncs which fantasy team owns each player (or free agent status)."""
+    """Syncs current fantasy ownership from element-status API."""
     sid = _resolve_season(season_id)
     result = sync_player_status(sid)
     return {"season_id": sid, "synced": result}
@@ -114,7 +136,7 @@ def route_sync_player_status(season_id: int | None = Query(default=None)):
 
 @app.post("/sync/transactions", tags=["sync"])
 def route_sync_transactions(season_id: int | None = Query(default=None)):
-    """Syncs waiver and trade transactions. New records only (ON CONFLICT DO NOTHING)."""
+    """Syncs waiver and trade transactions."""
     sid = _resolve_season(season_id)
     result = sync_transactions(sid)
     return {"season_id": sid, "synced": result}
@@ -122,7 +144,7 @@ def route_sync_transactions(season_id: int | None = Query(default=None)):
 
 @app.post("/sync/fixtures", tags=["sync"])
 def route_sync_fixtures(season_id: int | None = Query(default=None)):
-    """Syncs all PL fixtures including scores for completed matches."""
+    """Syncs PL fixture schedule and scores."""
     sid = _resolve_season(season_id)
     result = sync_fixtures(sid)
     return {"season_id": sid, "synced": result}
@@ -130,7 +152,7 @@ def route_sync_fixtures(season_id: int | None = Query(default=None)):
 
 @app.post("/sync/stats/{gw}", tags=["sync"])
 def route_sync_gw_stats(gw: int, season_id: int | None = Query(default=None)):
-    """Syncs per-player points and stats for a specific gameweek."""
+    """Syncs live player stats for a specific gameweek."""
     if gw < 1 or gw > 38:
         raise HTTPException(status_code=400, detail="GW must be between 1 and 38")
     sid = _resolve_season(season_id)
@@ -140,7 +162,7 @@ def route_sync_gw_stats(gw: int, season_id: int | None = Query(default=None)):
 
 @app.post("/sync/lineups/{gw}", tags=["sync"])
 def route_sync_lineups(gw: int, season_id: int | None = Query(default=None)):
-    """Syncs all team lineups (picks) for a specific gameweek."""
+    """Syncs team lineups for a specific gameweek."""
     if gw < 1 or gw > 38:
         raise HTTPException(status_code=400, detail="GW must be between 1 and 38")
     sid = _resolve_season(season_id)
@@ -148,29 +170,9 @@ def route_sync_lineups(gw: int, season_id: int | None = Query(default=None)):
     return {"season_id": sid, "gw": gw, "synced": result}
 
 
-@app.post("/sync/all", tags=["sync"])
-def route_sync_all(season_id: int | None = Query(default=None)):
-    """
-    Runs all non-GW-specific syncs in the correct order.
-    Use for initial load or daily refresh. Does NOT sync per-GW stats/lineups.
-    """
-    sid = _resolve_season(season_id)
-    results = {}
-    results["bootstrap"]      = sync_bootstrap(sid)
-    results["fantasy_teams"]  = sync_fantasy_teams(sid)
-    results["matches"]        = sync_fantasy_matches(sid)
-    results["player_status"]  = sync_player_status(sid)
-    results["transactions"]   = sync_transactions(sid)
-    results["fixtures"]       = sync_fixtures(sid)
-    return {"season_id": sid, "synced": results}
-
-
 @app.post("/sync/standings", tags=["sync"])
 def route_sync_standings(season_id: int | None = Query(default=None)):
-    """
-    Rebuilds standings from fantasy_matches.
-    Run after /sync/matches. Calculates W/D/L, league points, and cumulative totals.
-    """
+    """Rebuilds standings from fantasy_matches."""
     sid = _resolve_season(season_id)
     result = sync_standings(sid)
     return {"season_id": sid, "synced": result}
@@ -187,55 +189,68 @@ def route_sync_draft_picks(season_id: int | None = Query(default=None)):
 @app.post("/sync/element-summaries", tags=["sync"])
 def route_sync_element_summaries(season_id: int | None = Query(default=None)):
     """
-    Syncs per-fixture history and historical season totals for all drafted players.
-    Calls FPL element-summary API once per drafted player (~90 calls with 0.1s delay).
-    Run once after draft sync — takes ~2 minutes.
+    Syncs per-fixture history for drafted players only (~90 players, ~10s).
+    Runs synchronously — completes within request timeout.
     """
     sid = _resolve_season(season_id)
     result = sync_element_summaries(sid)
     return {"season_id": sid, "synced": result}
 
 
-# =============================================================================
-# main.py — ADD these two new sync routes
-# =============================================================================
-# Add these after the existing /sync/player-status route.
-# Also import the new functions at the top of main.py:
-#   from sync import (..., sync_ownership_from_draft, sync_pl_team_records)
-# =============================================================================
- 
- 
-@app.post("/sync/ownership", tags=["sync"])
-def route_sync_ownership(season_id: int | None = Query(default=None)):
+@app.post("/sync/all-element-summaries", tags=["sync"])
+def route_sync_all_element_summaries(
+    background_tasks: BackgroundTasks,
+    season_id: int | None = Query(default=None),
+):
     """
-    Builds per-GW ownership history from draft picks + accepted transactions.
-    Creates/populates player_ownership_history table.
-    Run after /sync/draft-picks and /sync/transactions.
+    Syncs per-fixture history for ALL players in the season (~700 players, ~70s).
+    Runs as a background task to avoid request timeout — returns a job_id immediately.
+    Poll GET /sync/job/{job_id} to check progress.
     """
+    import uuid
     sid = _resolve_season(season_id)
-    result = sync_ownership_from_draft(sid)
-    return {"season_id": sid, "synced": result}
- 
- 
+    job_id = f"all-elements-{sid}-{uuid.uuid4().hex[:8]}"
+    background_tasks.add_task(_run_background_sync, job_id, sync_all_element_summaries, sid)
+    return {
+        "season_id": sid,
+        "job_id": job_id,
+        "status": "started",
+        "message": f"Syncing all players in background. Poll GET /sync/job/{job_id} for status.",
+        "poll_url": f"/sync/job/{job_id}",
+    }
+
+
 @app.post("/sync/pl-records", tags=["sync"])
 def route_sync_pl_records(season_id: int | None = Query(default=None)):
-    """
-    Derives W/D/L/points/position for each PL team from the fixtures table.
-    The FPL bootstrap returns all zeros during the off-season, so we compute
-    these ourselves from finished fixture scores.
-    Run after /sync/fixtures.
-    """
+    """Derives W/D/L/points/position from fixtures. Run after /sync/fixtures."""
     sid = _resolve_season(season_id)
     result = sync_pl_team_records(sid)
     return {"season_id": sid, "synced": result}
 
-@app.post("/sync/all-element-summaries", tags=["sync"])
-def route_sync_all_element_summaries(season_id: int | None = Query(default=None)):
+
+@app.post("/sync/ownership", tags=["sync"])
+def route_sync_ownership(season_id: int | None = Query(default=None)):
+    """Builds per-GW ownership history from draft picks + transactions."""
+    sid = _resolve_season(season_id)
+    result = sync_ownership_from_draft(sid)
+    return {"season_id": sid, "synced": result}
+
+
+@app.post("/sync/all", tags=["sync"])
+def route_sync_all(season_id: int | None = Query(default=None)):
     """
-    Syncs per-fixture history for ALL players in the season (~700 players, ~70s).
-    Use this instead of /sync/element-summaries when you want undrafted players
-    to have fixture history for drill-through and DC data.
+    Runs all non-GW-specific syncs in order.
+    Use for initial load or daily refresh. Does NOT sync GW stats/lineups.
     """
     sid = _resolve_season(season_id)
-    result = sync_all_element_summaries(sid)
-    return {"season_id": sid, "synced": result}
+    results = {}
+    results["bootstrap"]     = sync_bootstrap(sid)
+    results["fantasy_teams"] = sync_fantasy_teams(sid)
+    results["matches"]       = sync_fantasy_matches(sid)
+    results["player_status"] = sync_player_status(sid)
+    results["transactions"]  = sync_transactions(sid)
+    results["fixtures"]      = sync_fixtures(sid)
+    results["standings"]     = sync_standings(sid)
+    results["draft_picks"]   = sync_draft_picks(sid)
+    results["pl_records"]    = sync_pl_team_records(sid)
+    return {"season_id": sid, "synced": results}
