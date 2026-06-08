@@ -192,3 +192,37 @@ def route_sync_element_summaries(season_id: int | None = Query(default=None)):
     sid = _resolve_season(season_id)
     result = sync_element_summaries(sid)
     return {"season_id": sid, "synced": result}
+
+
+# =============================================================================
+# main.py — ADD these two new sync routes
+# =============================================================================
+# Add these after the existing /sync/player-status route.
+# Also import the new functions at the top of main.py:
+#   from sync import (..., sync_ownership_from_draft, sync_pl_team_records)
+# =============================================================================
+ 
+ 
+@app.post("/sync/ownership", tags=["sync"])
+def route_sync_ownership(season_id: int | None = Query(default=None)):
+    """
+    Builds per-GW ownership history from draft picks + accepted transactions.
+    Creates/populates player_ownership_history table.
+    Run after /sync/draft-picks and /sync/transactions.
+    """
+    sid = _resolve_season(season_id)
+    result = sync_ownership_from_draft(sid)
+    return {"season_id": sid, "synced": result}
+ 
+ 
+@app.post("/sync/pl-records", tags=["sync"])
+def route_sync_pl_records(season_id: int | None = Query(default=None)):
+    """
+    Derives W/D/L/points/position for each PL team from the fixtures table.
+    The FPL bootstrap returns all zeros during the off-season, so we compute
+    these ourselves from finished fixture scores.
+    Run after /sync/fixtures.
+    """
+    sid = _resolve_season(season_id)
+    result = sync_pl_team_records(sid)
+    return {"season_id": sid, "synced": result}
