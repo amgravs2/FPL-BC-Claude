@@ -716,6 +716,7 @@ def get_draft_scorecard(season_id: int):
     ]
 
     # 3. Club bias — attack (MID+FWD) vs defence (GKP+DEF) per manager
+    # Per-manager club bias
     club_bias = {}
     for p in picks:
         tid = p['team_id']
@@ -729,10 +730,26 @@ def get_draft_scorecard(season_id: int):
         for tid, clubs in club_bias.items()
     ]
 
+    # League-wide club bias (all managers combined)
+    league_club_bias = {}
+    for p in picks:
+        club = p['pl_team']
+        side = 'attack' if p['position'] in ('MID', 'FWD') else 'defence'
+        league_club_bias.setdefault(club, {'attack': 0, 'defence': 0})
+        league_club_bias[club][side] += 1
+
+    league_club_bias_list = [
+        {'club': club, 'attack': counts['attack'], 'defence': counts['defence']}
+        for club, counts in sorted(league_club_bias.items(),
+                                   key=lambda x: x[1]['attack'] + x[1]['defence'],
+                                   reverse=True)
+    ]
+
     dna = {
-        'round_pair_counts': round_pair_counts,
-        'mean_round_rows':   mean_round_rows,
-        'club_bias':         club_bias_rows,
+        'round_pair_counts':   round_pair_counts,
+        'mean_round_rows':     mean_round_rows,
+        'club_bias':           club_bias_rows,
+        'league_club_bias':    league_club_bias_list,
     }
 
     return {
