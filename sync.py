@@ -748,6 +748,7 @@ def sync_draft_picks(season_id: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def sync_element_summaries(season_id: int) -> dict:
+    """Syncs per-fixture history for drafted players only (~90 players, ~10s)."""
     import time
 
     with get_conn() as conn:
@@ -763,6 +764,8 @@ def sync_element_summaries(season_id: int) -> dict:
 
     if not player_ids:
         return {"error": "No drafted players found for this season"}
+
+    return _sync_element_summaries_for_players(player_ids, current_season_name)
 
     fixture_records = []
     season_records  = []
@@ -886,7 +889,129 @@ def sync_element_summaries(season_id: int) -> dict:
         "season_records":  len(season_records),
         "skipped":         skipped,
     }
+def _sync_element_summaries_for_players(player_ids: list, current_season_name: str) -> dict:
+    import time
 
+    fixture_records = []
+    season_records  = []
+    skipped         = 0
+
+    for player_id in player_ids:
+        try:
+            data = fetch_element_summary(player_id)
+
+            for fix in data.get("history", []):
+                fixture_records.append((
+                    player_id,
+                    fix.get("fixture"),
+                    fix.get("round", 0),
+                    fix.get("opponent_team"),
+                    fix.get("was_home", False),
+                    fix.get("kickoff_time"),
+                    _int(fix.get("minutes")),
+                    _int(fix.get("goals_scored")),
+                    _int(fix.get("assists")),
+                    _int(fix.get("clean_sheets")),
+                    _int(fix.get("goals_conceded")),
+                    _int(fix.get("own_goals")),
+                    _int(fix.get("penalties_saved")),
+                    _int(fix.get("penalties_missed")),
+                    _int(fix.get("yellow_cards")),
+                    _int(fix.get("red_cards")),
+                    _int(fix.get("bonus")),
+                    _int(fix.get("bps")),
+                    _int(fix.get("total_points")),
+                    _int(fix.get("value")),
+                    current_season_name,
+                    _int(fix.get("saves")),
+                    _int(fix.get("defensive_contribution")),
+                    _int(fix.get("clearances_blocks_interceptions")),
+                    _int(fix.get("recoveries")),
+                    _int(fix.get("tackles")),
+                ))
+
+            for past in data.get("history_past", []):
+                season_records.append((
+                    player_id,
+                    past.get("season_name"),
+                    _int(past.get("start_cost")),
+                    _int(past.get("end_cost")),
+                    _int(past.get("total_points")),
+                    _int(past.get("minutes")),
+                    _int(past.get("goals_scored")),
+                    _int(past.get("assists")),
+                    _int(past.get("clean_sheets")),
+                    _int(past.get("goals_conceded")),
+                    _int(past.get("own_goals")),
+                    _int(past.get("penalties_saved")),
+                    _int(past.get("penalties_missed")),
+                    _int(past.get("yellow_cards")),
+                    _int(past.get("red_cards")),
+                    _int(past.get("saves")),
+                    _int(past.get("bonus")),
+                    _int(past.get("bps")),
+                    _float(past.get("influence")),
+                    _float(past.get("creativity")),
+                    _float(past.get("threat")),
+                    _float(past.get("ict_index")),
+                ))
+
+            time.sleep(0.1)
+
+        except Exception as e:
+            logger.warning(f"Skipping player {player_id}: {e}")
+            skipped += 1
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if fixture_records:
+                execute_values(cur, """
+                    INSERT INTO player_fixture_history (
+                        player_id, fixture_id, gw, opponent_team, was_home,
+                        kickoff_time, minutes, goals_scored, assists, clean_sheets,
+                        goals_conceded, own_goals, penalties_saved, penalties_missed,
+                        yellow_cards, red_cards, bonus, bps, total_points,
+                        value, season_name,
+                        saves, defensive_contribution,
+                        clearances_blocks_interceptions, recoveries, tackles
+                    ) VALUES %s
+                    ON CONFLICT (player_id, fixture_id) DO UPDATE SET
+                        total_points                    = EXCLUDED.total_points,
+                        bonus                           = EXCLUDED.bonus,
+                        bps                             = EXCLUDED.bps,
+                        value                           = EXCLUDED.value,
+                        season_name                     = EXCLUDED.season_name,
+                        saves                           = EXCLUDED.saves,
+                        defensive_contribution          = EXCLUDED.defensive_contribution,
+                        clearances_blocks_interceptions = EXCLUDED.clearances_blocks_interceptions,
+                        recoveries                      = EXCLUDED.recoveries,
+                        tackles                         = EXCLUDED.tackles;
+                """, fixture_records)
+
+            if season_records:
+                execute_values(cur, """
+                    INSERT INTO player_season_history (
+                        player_id, season_name, start_cost, end_cost, total_points,
+                        minutes, goals_scored, assists, clean_sheets, goals_conceded,
+                        own_goals, penalties_saved, penalties_missed, yellow_cards,
+                        red_cards, saves, bonus, bps, influence, creativity, threat,
+                        ict_index
+                    ) VALUES %s
+                    ON CONFLICT (player_id, season_name) DO UPDATE SET
+                        total_points = EXCLUDED.total_points,
+                        minutes      = EXCLUDED.minutes,
+                        goals_scored = EXCLUDED.goals_scored,
+                        assists      = EXCLUDED.assists;
+                """, season_records)
+
+        conn.commit()
+
+    return {
+        "players_synced":  len(player_ids) - skipped,
+        "fixture_records": len(fixture_records),
+        "season_records":  len(season_records),
+        "skipped":         skipped,
+    }
 
 # ---------------------------------------------------------------------------
 # NEW: sync_pl_team_records
