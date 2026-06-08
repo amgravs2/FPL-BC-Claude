@@ -16,6 +16,7 @@ from sync import (
     sync_lineups,
     sync_standings,
     sync_draft_picks,
+    sync_element_summaries,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -178,4 +179,16 @@ def route_sync_draft_picks(season_id: int | None = Query(default=None)):
     """Syncs draft pick order for the season."""
     sid = _resolve_season(season_id)
     result = sync_draft_picks(sid)
+    return {"season_id": sid, "synced": result}
+
+
+@app.post("/sync/element-summaries", tags=["sync"])
+def route_sync_element_summaries(season_id: int | None = Query(default=None)):
+    """
+    Syncs per-fixture history and historical season totals for all drafted players.
+    Calls FPL element-summary API once per drafted player (~90 calls with 0.1s delay).
+    Run once after draft sync — takes ~2 minutes.
+    """
+    sid = _resolve_season(season_id)
+    result = sync_element_summaries(sid)
     return {"season_id": sid, "synced": result}
