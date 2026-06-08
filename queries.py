@@ -599,20 +599,23 @@ def get_draft_scorecard(season_id: int):
                     dp.was_auto,
                     COALESCE(SUM(pgs.total_points), 0) AS season_points,
                     RANK() OVER (ORDER BY COALESCE(SUM(pgs.total_points), 0) DESC)
-                        AS points_rank
+                        AS points_rank,
+                    plt.short_name AS pl_team
                 FROM draft_picks dp
                 JOIN fantasy_teams ft
                     ON ft.id = dp.entry_id
                     AND ft.season_id = dp.season_id
                 JOIN players p ON p.id = dp.player_id
                 JOIN element_type et ON et.id = p.position
+                JOIN premier_league_teams plt
+                    ON plt.id = p.team AND plt.season_id = dp.season_id
                 LEFT JOIN player_gameweek_stats pgs
                     ON pgs.player_id = dp.player_id
                     AND pgs.season_id = dp.season_id
                 WHERE dp.season_id = %s
                 GROUP BY dp.round, dp.overall_pick, ft.player_first_name,
                          ft.internal_team_id, p.first_name, p.second_name,
-                         p.id, et.singular_name_short, dp.was_auto
+                         p.id, et.singular_name_short, dp.was_auto, plt.short_name
                 ORDER BY dp.overall_pick;
             """, (season_id,))
             rows = cur.fetchall()
@@ -629,6 +632,7 @@ def get_draft_scorecard(season_id: int):
             "was_auto":      r[7],
             "season_points": r[8],
             "points_rank":   r[9],
+            "pl_team":       r[10],
         }
         for r in rows
     ]
@@ -1156,4 +1160,70 @@ def get_fixtures_upcoming(season_id: int):
         "current_gw": current_gw,
         "teams":      teams,
         "fixtures":   fixtures,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Player historical season stats (from element-summary)
+# ---------------------------------------------------------------------------
+
+@router.get("/player/{player_id}/history")
+def get_player_history(player_id: int):
+    """Historical season totals for a player across all FPL seasons."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT season_name, total_points, minutes, goals_scored, assists,
+                       clean_sheets, bonus, saves, yellow_cards, red_cards,
+                       start_cost, end_cost
+                FROM player_season_history
+                WHERE player_id = %s
+                ORDER BY season_name DESC;
+            """, (player_id,))
+            rows = cur.fetchall()
+
+            # Also get current season from player_gameweek_stats
+            cur.execute("""
+                SELECT SUM(total_points), SUM(minutes), SUM(goals), SUM(assists),
+                       SUM(clean_sheets), SUM(bonus), SUM(saves)
+                FROM player_gameweek_stats
+                WHERE player_id = %s;
+            """, (player_id,))
+            current = cur.fetchone()
+
+            cur.execute("SELECT first_name, second_name, web_name FROM players WHERE id = %s", (player_id,))
+            player = cur.fetchone()
+
+    history = [
+        {
+            "season":       r[0],
+            "total_points": r[1],
+            "minutes":      r[2],
+            "goals":        r[3],
+            "assists":      r[4],
+            "clean_sheets": r[5],
+            "bonus":        r[6],
+            "saves":        r[7],
+            "yellow_cards": r[8],
+            "red_cards":    r[9],
+            "start_cost":   r[10] / 10 if r[10] else None,
+            "end_cost":     r[11] / 10 if r[11] else None,
+        }
+        for r in rows
+    ]
+
+    return {
+        "player_id":   player_id,
+        "name":        f"{player[0]} {player[1]}" if player else "Unknown",
+        "web_name":    player[2] if player else "Unknown",
+        "history":     history,
+        "current_season": {
+            "total_points": current[0] or 0,
+            "minutes":      current[1] or 0,
+            "goals":        current[2] or 0,
+            "assists":      current[3] or 0,
+            "clean_sheets": current[4] or 0,
+            "bonus":        current[5] or 0,
+            "saves":        current[6] or 0,
+        } if current else None
     }
