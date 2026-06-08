@@ -768,30 +768,45 @@ def get_draft_scorecard(season_id: int):
 
 @router.get("/season/{season_id}/players")
 def get_player_stats(season_id: int):
-    """All players with season stats + fantasy ownership info."""
+    """All players with season stats + fantasy ownership info.
+    
+    FIXES:
+    - Free agent bug: the old query used HAVING total_points > 0 which caused
+      all owned players with 0 pts to show as FA. Now we include owned players
+      regardless of points, and only exclude unowned 0-pt players.
+    - Adds: defensive_contribution, pl_team_full, status, news,
+      chance_of_playing_next_round, chance_of_playing_this_round
+    """
     _season_or_404(season_id)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT
                     p.id,
-                    p.first_name || ' ' || p.second_name AS name,
+                    p.first_name || ' ' || p.second_name   AS name,
                     p.web_name,
-                    et.singular_name_short AS position,
-                    plt.short_name         AS pl_team,
-                    COALESCE(SUM(pgs.total_points), 0)   AS total_points,
-                    COALESCE(SUM(pgs.goals), 0)           AS goals,
-                    COALESCE(SUM(pgs.assists), 0)        AS assists,
-                    COALESCE(SUM(pgs.clean_sheets), 0)   AS clean_sheets,
-                    COALESCE(SUM(pgs.bonus), 0)          AS bonus,
-                    COALESCE(SUM(pgs.minutes), 0)        AS minutes,
-                    COALESCE(SUM(pgs.saves), 0)          AS saves,
-                    COALESCE(SUM(pgs.yellow_cards), 0)   AS yellow_cards,
-                    COALESCE(SUM(pgs.red_cards), 0)      AS red_cards,
-                    COALESCE(SUM(pgs.goals_conceded), 0) AS goals_conceded,
+                    et.singular_name_short                  AS position,
+                    plt.short_name                          AS pl_team,
+                    plt.name                                AS pl_team_full,
+                    COALESCE(SUM(pgs.total_points), 0)      AS total_points,
+                    COALESCE(SUM(pgs.goals), 0)             AS goals,
+                    COALESCE(SUM(pgs.assists), 0)           AS assists,
+                    COALESCE(SUM(pgs.clean_sheets), 0)      AS clean_sheets,
+                    COALESCE(SUM(pgs.bonus), 0)             AS bonus,
+                    COALESCE(SUM(pgs.minutes), 0)           AS minutes,
+                    COALESCE(SUM(pgs.saves), 0)             AS saves,
+                    COALESCE(SUM(pgs.yellow_cards), 0)      AS yellow_cards,
+                    COALESCE(SUM(pgs.red_cards), 0)         AS red_cards,
+                    COALESCE(SUM(pgs.goals_conceded), 0)    AS goals_conceded,
+                    COALESCE(SUM(pgs.defensive_contribution), 0) AS defensive_contribution,
                     COUNT(CASE WHEN pgs.minutes = 0 THEN 1 END) AS blank_gws,
-                    ft.player_first_name                  AS owner,
-                    ft.internal_team_id                   AS owner_team_id
+                    ft.player_first_name                    AS owner,
+                    ft.internal_team_id                     AS owner_team_id,
+                    p.status,
+                    p.news,
+                    p.chance_of_playing_next_round,
+                    p.chance_of_playing_this_round,
+                    p.team                                  AS pl_team_id
                 FROM players p
                 JOIN element_type et ON et.id = p.position
                 JOIN premier_league_teams plt
@@ -803,37 +818,285 @@ def get_player_stats(season_id: int):
                 LEFT JOIN fantasy_teams ft
                     ON ft.id = pfs.team_id AND ft.season_id = %s
                 WHERE p.season_id = %s
-                GROUP BY p.id, p.first_name, p.second_name, p.web_name,
-                         et.singular_name_short, plt.short_name,
-                         ft.player_first_name, ft.internal_team_id
-                HAVING COALESCE(SUM(pgs.total_points), 0) > 0
+                GROUP BY
+                    p.id, p.first_name, p.second_name, p.web_name,
+                    et.singular_name_short, plt.short_name, plt.name,
+                    ft.player_first_name, ft.internal_team_id,
+                    p.status, p.news,
+                    p.chance_of_playing_next_round, p.chance_of_playing_this_round,
+                    p.team
+                HAVING
+                    -- Include owned players always; exclude unowned 0-pt players
+                    ft.internal_team_id IS NOT NULL
+                    OR COALESCE(SUM(pgs.total_points), 0) > 0
                 ORDER BY total_points DESC;
             """, (season_id, season_id, season_id, season_id, season_id))
             rows = cur.fetchall()
-
+ 
     return [
         {
-            "player_id":     r[0],
-            "name":          r[1],
-            "web_name":      r[2],
-            "position":      r[3],
-            "pl_team":       r[4],
-            "total_points":  r[5],
-            "goals":         r[6],
-            "assists":       r[7],
-            "clean_sheets":  r[8],
-            "bonus":         r[9],
-            "minutes":       r[10],
-            "saves":         r[11],
-            "yellow_cards":  r[12],
-            "red_cards":     r[13],
-            "goals_conceded": r[14],
-            "blank_gws":     r[15],
-            "owner":         r[16],
-            "owner_team_id": r[17],
+            "player_id":                    r[0],
+            "name":                         r[1],
+            "web_name":                     r[2],
+            "position":                     r[3],
+            "pl_team":                      r[4],
+            "pl_team_full":                 r[5],
+            "total_points":                 r[6],
+            "goals":                        r[7],
+            "assists":                      r[8],
+            "clean_sheets":                 r[9],
+            "bonus":                        r[10],
+            "minutes":                      r[11],
+            "saves":                        r[12],
+            "yellow_cards":                 r[13],
+            "red_cards":                    r[14],
+            "goals_conceded":               r[15],
+            "defensive_contribution":       r[16],
+            "blank_gws":                    r[17],
+            "owner":                        r[18],
+            "owner_team_id":                r[19],
+            "status":                       r[20],
+            "news":                         r[21],
+            "chance_of_playing_next_round": r[22],
+            "chance_of_playing_this_round": r[23],
+            "pl_team_id":                   r[24],
         }
         for r in rows
     ]
+
+ 
+# ---------------------------------------------------------------------------
+# NEW: Player drill-through page data
+# ---------------------------------------------------------------------------
+ 
+@router.get("/player/{player_id}/drill")
+def get_player_drill(player_id: int):
+    """
+    Full drill-through for a player:
+    - Basic info (name, position, team)
+    - Historic season totals (from player_season_history)
+    - Per-GW stats per season (from player_gameweek_stats)
+    - Ownership history across all seasons (who owned them each GW)
+    - Fixture history vs each real PL opponent (from player_fixture_history)
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Player meta
+            cur.execute("""
+                SELECT
+                    p.id, p.first_name, p.second_name, p.web_name,
+                    et.singular_name_short AS position,
+                    plt.name               AS pl_team_full,
+                    plt.short_name         AS pl_team,
+                    p.status, p.news,
+                    p.chance_of_playing_next_round
+                FROM players p
+                JOIN element_type et ON et.id = p.position
+                JOIN premier_league_teams plt
+                    ON plt.id = p.team AND plt.season_id = p.season_id
+                WHERE p.id = %s
+                ORDER BY p.season_id DESC
+                LIMIT 1;
+            """, (player_id,))
+            meta = cur.fetchone()
+ 
+            if not meta:
+                raise HTTPException(status_code=404, detail="Player not found")
+ 
+            # Historical season totals
+            cur.execute("""
+                SELECT season_name, total_points, minutes, goals_scored, assists,
+                       clean_sheets, bonus, saves, yellow_cards, red_cards,
+                       start_cost, end_cost
+                FROM player_season_history
+                WHERE player_id = %s
+                ORDER BY season_name DESC;
+            """, (player_id,))
+            season_history = cur.fetchall()
+ 
+            # Current season GW-by-GW (all seasons in our DB)
+            cur.execute("""
+                SELECT
+                    se.name    AS season_name,
+                    pgs.season_id,
+                    pgs.gw,
+                    pgs.total_points,
+                    pgs.goals,
+                    pgs.assists,
+                    pgs.clean_sheets,
+                    pgs.bonus,
+                    pgs.saves,
+                    pgs.minutes,
+                    pgs.yellow_cards,
+                    pgs.red_cards,
+                    pgs.defensive_contribution
+                FROM player_gameweek_stats pgs
+                JOIN seasons se ON se.id = pgs.season_id
+                WHERE pgs.player_id = %s
+                ORDER BY pgs.season_id DESC, pgs.gw ASC;
+            """, (player_id,))
+            gw_stats = cur.fetchall()
+ 
+            # Ownership history: who owned this player each GW across all seasons
+            cur.execute("""
+                SELECT
+                    se.name    AS season_name,
+                    gl.season_id,
+                    gl.gw,
+                    ft.player_first_name  AS owner,
+                    ft.team_name          AS team_name,
+                    ft.internal_team_id   AS team_id,
+                    gl.multiplier,
+                    gl.is_captain
+                FROM gameweek_lineups gl
+                JOIN fantasy_teams ft
+                    ON ft.id = gl.team_id AND ft.season_id = gl.season_id
+                JOIN seasons se ON se.id = gl.season_id
+                WHERE gl.player_id = %s
+                ORDER BY gl.season_id DESC, gl.gw ASC;
+            """, (player_id,))
+            ownership = cur.fetchall()
+ 
+            # Fixture-level history vs each PL opponent
+            cur.execute("""
+                SELECT
+                    pfh.opponent_team,
+                    plt.name               AS opponent_full,
+                    plt.short_name         AS opponent_short,
+                    pfh.was_home,
+                    pfh.kickoff_time,
+                    pfh.total_points,
+                    pfh.goals_scored,
+                    pfh.assists,
+                    pfh.clean_sheet,
+                    pfh.saves,
+                    pfh.bonus,
+                    pfh.minutes,
+                    pfh.yellow_cards,
+                    pfh.red_cards,
+                    pfh.value,
+                    pfh.round
+                FROM player_fixture_history pfh
+                LEFT JOIN premier_league_teams plt
+                    ON plt.id = pfh.opponent_team
+                WHERE pfh.player_id = %s
+                ORDER BY pfh.kickoff_time DESC;
+            """, (player_id,))
+            fixture_history = cur.fetchall()
+ 
+    # Aggregate per-opponent stats
+    opponent_agg = {}
+    for r in fixture_history:
+        opp_id = r[0]
+        if opp_id not in opponent_agg:
+            opponent_agg[opp_id] = {
+                "opponent_id":    opp_id,
+                "opponent_full":  r[1] or f"Team {opp_id}",
+                "opponent_short": r[2] or "???",
+                "appearances":    0,
+                "total_points":   0,
+                "goals":          0,
+                "assists":        0,
+                "clean_sheets":   0,
+                "bonus":          0,
+                "minutes":        0,
+            }
+        ag = opponent_agg[opp_id]
+        ag["appearances"]  += 1
+        ag["total_points"] += r[5] or 0
+        ag["goals"]        += r[6] or 0
+        ag["assists"]      += r[7] or 0
+        ag["clean_sheets"] += r[8] or 0
+        ag["bonus"]        += r[10] or 0
+        ag["minutes"]      += r[11] or 0
+ 
+    return {
+        "player": {
+            "id":                           meta[0],
+            "name":                         f"{meta[1]} {meta[2]}",
+            "web_name":                     meta[3],
+            "position":                     meta[4],
+            "pl_team_full":                 meta[5],
+            "pl_team":                      meta[6],
+            "status":                       meta[7],
+            "news":                         meta[8],
+            "chance_of_playing_next_round": meta[9],
+        },
+        "season_history": [
+            {
+                "season":       r[0],
+                "total_points": r[1],
+                "minutes":      r[2],
+                "goals":        r[3],
+                "assists":      r[4],
+                "clean_sheets": r[5],
+                "bonus":        r[6],
+                "saves":        r[7],
+                "yellow_cards": r[8],
+                "red_cards":    r[9],
+                "start_cost":   r[10] / 10 if r[10] else None,
+                "end_cost":     r[11] / 10 if r[11] else None,
+            }
+            for r in season_history
+        ],
+        "gw_stats": [
+            {
+                "season_name":            r[0],
+                "season_id":              r[1],
+                "gw":                     r[2],
+                "total_points":           r[3],
+                "goals":                  r[4],
+                "assists":                r[5],
+                "clean_sheets":           r[6],
+                "bonus":                  r[7],
+                "saves":                  r[8],
+                "minutes":                r[9],
+                "yellow_cards":           r[10],
+                "red_cards":              r[11],
+                "defensive_contribution": r[12],
+            }
+            for r in gw_stats
+        ],
+        "ownership_history": [
+            {
+                "season_name": r[0],
+                "season_id":   r[1],
+                "gw":          r[2],
+                "owner":       r[3],
+                "team_name":   r[4],
+                "team_id":     r[5],
+                "multiplier":  r[6],
+                "is_captain":  r[7],
+            }
+            for r in ownership
+        ],
+        "fixture_history": [
+            {
+                "opponent_id":    r[0],
+                "opponent_full":  r[1] or f"Team {r[0]}",
+                "opponent_short": r[2] or "???",
+                "was_home":       r[3],
+                "kickoff_time":   str(r[4]) if r[4] else None,
+                "total_points":   r[5],
+                "goals":          r[6],
+                "assists":        r[7],
+                "clean_sheet":    r[8],
+                "saves":          r[9],
+                "bonus":          r[10],
+                "minutes":        r[11],
+                "yellow_cards":   r[12],
+                "red_cards":      r[13],
+                "value":          r[14] / 10 if r[14] else None,
+                "round":          r[15],
+            }
+            for r in fixture_history
+        ],
+        "vs_opponents": sorted(
+            list(opponent_agg.values()),
+            key=lambda x: x["total_points"],
+            reverse=True
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
