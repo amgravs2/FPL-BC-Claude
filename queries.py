@@ -793,6 +793,15 @@ def get_player_stats(season_id: int):
                     COALESCE(SUM(pgs.goals_conceded), 0)    AS goals_conceded,
                     COALESCE(SUM(pgs.defensive_contribution), 0) AS defensive_contribution,
                     COUNT(CASE WHEN pgs.minutes = 0 THEN 1 END) AS blank_gws,
+                    -- Average pts over last 5 GWs (subquery keyed on player + season)
+                    COALESCE((
+                        SELECT ROUND(AVG(sub.total_points)::numeric, 1)
+                        FROM (
+                            SELECT total_points FROM player_gameweek_stats
+                            WHERE player_id = p.id AND season_id = %s
+                            ORDER BY gw DESC LIMIT 5
+                        ) sub
+                    ), 0) AS avg_pts_5gw,
                     ft.player_first_name                    AS owner,
                     ft.internal_team_id                     AS owner_team_id,
                     p.status,
@@ -823,7 +832,7 @@ def get_player_stats(season_id: int):
                     ft.internal_team_id IS NOT NULL
                     OR COALESCE(SUM(pgs.total_points), 0) > 0
                 ORDER BY total_points DESC;
-            """, (season_id, season_id, season_id, season_id, season_id))
+            """, (season_id, season_id, season_id, season_id, season_id, season_id))
             rows = cur.fetchall()
 
     return [
@@ -853,6 +862,7 @@ def get_player_stats(season_id: int):
             "chance_of_playing_next_round": r[22],
             "chance_of_playing_this_round": r[23],
             "pl_team_id":                   r[24],
+            "avg_pts_5gw":                  float(r[25]) if r[25] else 0,
         }
         for r in rows
     ]
@@ -890,7 +900,9 @@ def get_player_gw_stats(season_id: int, player_id: int):
                     COALESCE(pgs.expected_assists, 0) AS xa,
                     pgs.bps,
                     ft.player_first_name AS owner_this_gw,
-                    ft.internal_team_id  AS owner_team_id_this_gw
+                    ft.internal_team_id  AS owner_team_id_this_gw,
+                    pfh.opponent_team    AS opponent_team_id,
+                    plt.short_name       AS opponent_short
                 FROM player_gameweek_stats pgs
                 LEFT JOIN gameweek_lineups gl
                     ON gl.player_id = pgs.player_id
@@ -899,6 +911,11 @@ def get_player_gw_stats(season_id: int, player_id: int):
                 LEFT JOIN fantasy_teams ft
                     ON ft.id = gl.team_id
                     AND ft.season_id = pgs.season_id
+                LEFT JOIN player_fixture_history pfh
+                    ON pfh.player_id = pgs.player_id
+                    AND pfh.gw = pgs.gw
+                LEFT JOIN premier_league_teams plt
+                    ON plt.id = pfh.opponent_team
                 WHERE pgs.player_id = %s
                   AND pgs.season_id = %s
                 ORDER BY pgs.gw;
@@ -925,6 +942,8 @@ def get_player_gw_stats(season_id: int, player_id: int):
                         "bps":                    r[14],
                         "owner_this_gw":          r[15],
                         "owner_team_id_this_gw":  r[16],
+                        "opponent_team_id":        r[17],
+                        "opponent_short":          r[18],
                     }
                     for r in primary_rows
                 ]
@@ -949,8 +968,12 @@ def get_player_gw_stats(season_id: int, player_id: int):
                     SUM(pfh.yellow_cards)   AS yellow_cards,
                     SUM(pfh.red_cards)      AS red_cards,
                     SUM(pfh.goals_conceded) AS goals_conceded,
-                    SUM(pfh.bps)            AS bps
+                    SUM(pfh.bps)            AS bps,
+                    MIN(pfh.opponent_team)  AS opponent_team_id,
+                    MIN(plt.short_name)     AS opponent_short
                 FROM player_fixture_history pfh
+                LEFT JOIN premier_league_teams plt
+                    ON plt.id = pfh.opponent_team
                 WHERE pfh.player_id = %s
                   AND pfh.season_name = %s
                 GROUP BY pfh.gw
@@ -977,6 +1000,8 @@ def get_player_gw_stats(season_id: int, player_id: int):
             "bps":                    r[11],
             "owner_this_gw":          None,
             "owner_team_id_this_gw":  None,
+            "opponent_team_id":        r[12],
+            "opponent_short":          r[13],
         }
         for r in fallback_rows
     ]
@@ -1624,6 +1649,7 @@ def get_player_drill(player_id: int):
                 "goals":          0,
                 "assists":        0,
                 "clean_sheets":   0,
+                "saves":          0,
                 "bonus":          0,
                 "minutes":        0,
             }
@@ -1633,6 +1659,7 @@ def get_player_drill(player_id: int):
         ag["goals"]        += r[6] or 0
         ag["assists"]      += r[7] or 0
         ag["clean_sheets"] += r[8] or 0
+        ag["saves"]        += r[9] or 0
         ag["bonus"]        += r[10] or 0
         ag["minutes"]      += r[11] or 0
 
