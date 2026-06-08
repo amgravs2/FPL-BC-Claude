@@ -148,7 +148,9 @@ def get_results_grid(season_id: int):
                     fm.entry_1_points,
                     fm.entry_2_points,
                     fm.entry_2,
-                    t2.player_first_name AS entry_2_name
+                    t2.player_first_name AS entry_2_name,
+                    t1.id AS entry_1_fpl_id,
+                    t2.id AS entry_2_fpl_id
                 FROM fantasy_matches fm
                 JOIN fantasy_teams t1
                     ON t1.internal_team_id = fm.entry_1
@@ -169,6 +171,8 @@ def get_results_grid(season_id: int):
             "entry_2_points": r[4],
             "entry_2_id":     r[5],
             "entry_2_name":   r[6],
+            "entry_1_fpl_id": r[7],
+            "entry_2_fpl_id": r[8],
         }
         for r in rows
     ]
