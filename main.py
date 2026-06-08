@@ -228,3 +228,14 @@ def route_sync_pl_records(season_id: int | None = Query(default=None)):
     sid = _resolve_season(season_id)
     result = sync_pl_team_records(sid)
     return {"season_id": sid, "synced": result}
+
+@app.post("/sync/all-element-summaries", tags=["sync"])
+def route_sync_all_element_summaries(season_id: int | None = Query(default=None)):
+    """
+    Syncs per-fixture history for ALL players in the season (~700 players, ~70s).
+    Use this instead of /sync/element-summaries when you want undrafted players
+    to have fixture history for drill-through and DC data.
+    """
+    sid = _resolve_season(season_id)
+    result = sync_all_element_summaries(sid)
+    return {"season_id": sid, "synced": result}
