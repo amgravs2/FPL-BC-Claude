@@ -20,6 +20,7 @@ from sync import (
     sync_all_element_summaries,
     sync_pl_team_records,
     sync_ownership_from_draft,
+    sync_team_strengths,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -254,3 +255,19 @@ def route_sync_all(season_id: int | None = Query(default=None)):
     results["draft_picks"]   = sync_draft_picks(sid)
     results["pl_records"]    = sync_pl_team_records(sid)
     return {"season_id": sid, "synced": results}
+
+
+ @app.post("/sync/team-strengths", tags=["sync"])
+ def route_sync_team_strengths(
+     gw: int | None = Query(default=None),
+     season_id: int | None = Query(default=None),
+ ):
+#     """
+#     Snapshots current FPL team strength values for the given GW.
+#     Pass ?gw= to record a specific GW (useful for backfilling).
+#     Defaults to current_event from FPL game endpoint.
+#     ON CONFLICT DO NOTHING — safe to call multiple times.
+#     """
+     sid = _resolve_season(season_id)
+     result = sync_team_strengths(sid, gw)
+     return {"season_id": sid, "synced": result}
