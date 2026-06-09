@@ -1249,6 +1249,14 @@ def get_transfer_analytics(season_id: int):
             else:
                 flag_rows = []
 
+            # ── Current max GW — needed before ownership window lookup ────────
+            cur.execute("""
+                SELECT COALESCE(MAX(gw), 38)
+                FROM player_gameweek_stats
+                WHERE season_id = %s;
+            """, (season_id,))
+            max_gw_db = cur.fetchone()[0]
+
             # ── Per-GW points for chart ───────────────────────────────────────
             player_ids = set()
             for t in transfers_raw:
@@ -1265,6 +1273,72 @@ def get_transfer_analytics(season_id: int):
                 """, (season_id, list(player_ids)))
                 for pid, gw, pts in cur.fetchall():
                     gw_pts.setdefault(pid, {})[gw] = pts
+
+            # ── Ownership windows: when was player_in actually held? ──────────
+            # For each transfer, find the GW range the incoming player was owned
+            # by this fantasy team, so we can compute a fair pts-per-GW delta
+            # over only the weeks they were actually held.
+            ownership_windows: dict = {}   # {tx_id: {from_gw, to_gw}}
+            if transfers_raw:
+                # Batch query: for each (team_id, player_in_id, transfer_gw) triple
+                # find the ownership span that starts at or after the transfer GW.
+                # We use player_ownership_history (from_gw / to_gw).
+                # Fallback: scan gameweek_lineups for first/last appearance.
+                tx_params = [
+                    (t["id"], t["fantasy_team_id"], t["player_in_id"], t["gw"])
+                    for t in transfers_raw
+                ]
+                # Ownership history approach — one row per ownership span
+                cur.execute("""
+                    SELECT req.tx_id, poh.from_gw, poh.to_gw
+                    FROM (VALUES %s) AS req(tx_id, team_id, player_id, transfer_gw)
+                    JOIN player_ownership_history poh
+                        ON poh.player_id  = req.player_id
+                        AND poh.team_id   = req.team_id
+                        AND poh.season_id = %s
+                        AND poh.from_gw  >= req.transfer_gw
+                    ORDER BY req.tx_id, poh.from_gw
+                """ % (
+                    "(" + "),(".join(
+                        cur.mogrify("%s,%s,%s,%s", p).decode() for p in tx_params
+                    ) + ")",
+                ), (season_id,))
+                for tx_id, from_gw, to_gw in cur.fetchall():
+                    if tx_id not in ownership_windows:
+                        ownership_windows[tx_id] = {
+                            "from_gw": from_gw,
+                            "to_gw":   to_gw or max_gw_db,
+                        }
+
+                # For any transfer not covered by ownership history, fall back to
+                # gameweek_lineups: find first and last GW the player appeared for
+                # this team after the transfer GW.
+                missing = [t for t in transfers_raw if t["id"] not in ownership_windows]
+                if missing:
+                    miss_params = [
+                        (t["id"], t["fantasy_team_id"], t["player_in_id"], t["gw"])
+                        for t in missing
+                    ]
+                    cur.execute("""
+                        SELECT req.tx_id, MIN(gl.gw) AS first_gw, MAX(gl.gw) AS last_gw
+                        FROM (VALUES %s) AS req(tx_id, team_id, player_id, transfer_gw)
+                        JOIN gameweek_lineups gl
+                            ON gl.player_id  = req.player_id
+                            AND gl.team_id   = req.team_id
+                            AND gl.season_id = %s
+                            AND gl.gw       >= req.transfer_gw
+                            AND gl.position <= 15
+                        GROUP BY req.tx_id
+                    """ % (
+                        "(" + "),(".join(
+                            cur.mogrify("%s,%s,%s,%s", p).decode() for p in miss_params
+                        ) + ")",
+                    ), (season_id,))
+                    for tx_id, first_gw, last_gw in cur.fetchall():
+                        ownership_windows[tx_id] = {
+                            "from_gw": first_gw,
+                            "to_gw":   last_gw,
+                        }
 
             # ── Fixtures + strengths for FDR smart score ──────────────────────
             cur.execute("""
@@ -1354,12 +1428,38 @@ def get_transfer_analytics(season_id: int):
         out_id = t["player_out_id"]
         tx_gw  = t["gw"]
 
+        # Full-season chart data (GW after transfer → end of season)
         chart = {}
         for gw in range(tx_gw + 1, max_gw + 1):
             chart[gw] = {
                 "in":  gw_pts.get(in_id,  {}).get(gw, 0),
                 "out": gw_pts.get(out_id, {}).get(gw, 0),
             }
+
+        # ── Ownership-window delta ────────────────────────────────────────────
+        # Only score points for the GWs the incoming player was actually held.
+        win = ownership_windows.get(t["id"])
+        if win:
+            w_from = win["from_gw"]
+            w_to   = min(win["to_gw"], max_gw)
+            gws_held = max(w_to - w_from + 1, 1)
+            pts_in_window  = sum(
+                gw_pts.get(in_id,  {}).get(gw, 0) for gw in range(w_from, w_to + 1)
+            )
+            pts_out_window = sum(
+                gw_pts.get(out_id, {}).get(gw, 0) for gw in range(w_from, w_to + 1)
+            )
+            delta_window   = pts_in_window - pts_out_window
+            delta_per_gw   = round(delta_window / gws_held, 2)
+        else:
+            # No ownership record — fall back to full-season window
+            w_from = tx_gw + 1
+            w_to   = max_gw
+            gws_held       = max(w_to - w_from + 1, 1)
+            pts_in_window  = t["points_in_after"]
+            pts_out_window = t["points_out_after"]
+            delta_window   = t["delta"]
+            delta_per_gw   = round(delta_window / gws_held, 2)
 
         snap_in  = flag_map.get((t["id"], "in"))
         snap_out = flag_map.get((t["id"], "out"))
@@ -1382,6 +1482,15 @@ def get_transfer_analytics(season_id: int):
             "fdr_in":            fdr_in,
             "fdr_out":           fdr_out,
             "smart_score":       smart_score,
+            # Ownership-window metrics
+            "gws_held":          gws_held,
+            "ownership_from":    w_from,
+            "ownership_to":      w_to,
+            "pts_in_window":     pts_in_window,
+            "pts_out_window":    pts_out_window,
+            "delta_window":      delta_window,
+            "delta_per_gw":      delta_per_gw,
+            "window_is_full_season": win is None,
         })
 
     # ── Manager summary ───────────────────────────────────────────────────────
@@ -1413,12 +1522,17 @@ def get_transfer_analytics(season_id: int):
             if m["total_moves"] else 0
         )
 
-    by_delta = sorted(transfers, key=lambda x: x["delta"], reverse=True)
+    by_delta     = sorted(transfers, key=lambda x: x["delta"],     reverse=True)
+    by_delta_pgw = sorted(transfers, key=lambda x: x["delta_per_gw"], reverse=True)
 
     return {
         "all_transfers":   transfers,
-        "best_transfer":   by_delta[0]  if by_delta else None,
-        "worst_transfer":  by_delta[-1] if by_delta else None,
+        # Raw total delta (full season, biased toward early transfers)
+        "best_transfer":   by_delta[0]      if by_delta else None,
+        "worst_transfer":  by_delta[-1]     if by_delta else None,
+        # Ownership-window normalised (pts/GW held — the fairer metric)
+        "best_transfer_pgw":  by_delta_pgw[0]  if by_delta_pgw else None,
+        "worst_transfer_pgw": by_delta_pgw[-1] if by_delta_pgw else None,
         "manager_summary": list(managers.values()),
     }
 
