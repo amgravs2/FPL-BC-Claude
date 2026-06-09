@@ -377,12 +377,8 @@ def sync_bootstrap(season_id: int) -> dict:
                 """, snapshot_records)
  
             counts["status_snapshots"] = len(snapshot_records)
- 
-        conn.commit()
- 
-    return counts
 
-# ── A) Add inside sync_bootstrap(), after the pl_teams execute_values block ──
+        # ── A) Add inside sync_bootstrap(), after the pl_teams execute_values block ──
  
             # Snapshot team strengths at the current GW.
             # ON CONFLICT DO NOTHING so we only record each GW once —
@@ -409,6 +405,12 @@ def sync_bootstrap(season_id: int) -> dict:
                     ON CONFLICT (team_id, season_id, gw) DO NOTHING;
                 """, strength_snap_records)
                 counts["strength_snapshots"] = len(strength_snap_records)
+ 
+        conn.commit()
+ 
+    return counts
+
+
   ─────────────────────────────────────────────────────────────────────────────
 # ── B) New standalone function — add to sync.py ──────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
