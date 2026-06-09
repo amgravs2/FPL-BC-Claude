@@ -133,6 +133,31 @@ def sync_bootstrap(season_id: int) -> dict:
             """, pl_records)
             counts["pl_teams"] = len(pl_records)
 
+            # 2a. Snapshot team strengths at the current GW.
+            # ON CONFLICT DO NOTHING — first sync of each GW wins, no overwrites.
+            gw_to_snap = current_id or next_id or 1
+            strength_snap_records = [
+                (
+                    t["id"], season_id, gw_to_snap,
+                    t.get("strength_attack_home"),
+                    t.get("strength_attack_away"),
+                    t.get("strength_defence_home"),
+                    t.get("strength_defence_away"),
+                )
+                for t in data.get("teams", [])
+                if t.get("strength_attack_home")
+            ]
+            if strength_snap_records:
+                execute_values(cur, """
+                    INSERT INTO team_strength_history (
+                        team_id, season_id, gw,
+                        strength_attack_home,  strength_attack_away,
+                        strength_defence_home, strength_defence_away
+                    ) VALUES %s
+                    ON CONFLICT (team_id, season_id, gw) DO NOTHING;
+                """, strength_snap_records)
+                counts["strength_snapshots"] = len(strength_snap_records)
+
             # 3. players
             p_records = [
                 (
@@ -235,7 +260,63 @@ def sync_bootstrap(season_id: int) -> dict:
             """, p_records)
             counts["players"] = len(p_records)
 
-            # 4. gameweeks
+            # 4. player_status_history — snapshot any status/news changes
+            cur.execute("""
+                SELECT DISTINCT ON (player_id)
+                    player_id, status, news,
+                    chance_of_playing_next_round,
+                    chance_of_playing_this_round
+                FROM player_status_history
+                WHERE season_id = %s
+                ORDER BY player_id, snapped_at DESC;
+            """, (season_id,))
+            existing_snapshots = {
+                row[0]: {
+                    "status":   row[1],
+                    "news":     row[2],
+                    "cop_next": row[3],
+                    "cop_this": row[4],
+                }
+                for row in cur.fetchall()
+            }
+
+            snapshot_records = []
+            for p in data.get("elements", []):
+                pid        = p.get("id")
+                new_status = p.get("status")
+                new_news   = p.get("news") or None
+                new_next   = p.get("chance_of_playing_next_round")
+                new_this   = p.get("chance_of_playing_this_round")
+
+                prev    = existing_snapshots.get(pid)
+                changed = (
+                    prev is None
+                    or prev["status"]   != new_status
+                    or prev["news"]     != new_news
+                    or prev["cop_next"] != new_next
+                    or prev["cop_this"] != new_this
+                )
+
+                if changed:
+                    snapshot_records.append((
+                        pid, season_id, current_id,
+                        new_status, new_news, p.get("news_added"),
+                        new_next, new_this,
+                    ))
+
+            if snapshot_records:
+                execute_values(cur, """
+                    INSERT INTO player_status_history (
+                        player_id, season_id, gw,
+                        status, news, news_added,
+                        chance_of_playing_next_round,
+                        chance_of_playing_this_round
+                    ) VALUES %s
+                    ON CONFLICT (player_id, season_id, snapped_at) DO NOTHING;
+                """, snapshot_records)
+            counts["status_snapshots"] = len(snapshot_records)
+
+            # 5. gameweeks
             events = data.get("events", {}).get("data", [])
             gw_records    = []
             gw1_deadline  = None
@@ -293,7 +374,7 @@ def sync_bootstrap(season_id: int) -> dict:
             """, gw_records)
             counts["gameweeks"] = len(gw_records)
 
-            # 5. Derive and update season start/end dates from GW1 / GW38
+            # 6. Derive and update season start/end dates from GW1 / GW38
             if gw1_deadline and gw38_deadline:
                 cur.execute("""
                     UPDATE seasons
@@ -302,134 +383,29 @@ def sync_bootstrap(season_id: int) -> dict:
                 """, (gw1_deadline.date(), gw38_deadline.date(), season_id))
                 counts["season_dates_updated"] = cur.rowcount
 
-        # ── Inside sync_bootstrap, after the players upsert block ────────────────────
- 
-            # 5. player_status_history — snapshot any status/news changes
-            #
-            # Strategy: for each player in the bootstrap, compare current
-            # status/news/chance against the most recent snapshot we have.
-            # Only insert a new row if something actually changed (or if
-            # this is the first snapshot for that player this season).
-            #
-            # We do this in Python to avoid a large per-row SQL round-trip.
- 
-            # Fetch the latest known snapshot for every player in this season.
-            cur.execute("""
-                SELECT DISTINCT ON (player_id)
-                    player_id,
-                    status,
-                    news,
-                    chance_of_playing_next_round,
-                    chance_of_playing_this_round
-                FROM player_status_history
-                WHERE season_id = %s
-                ORDER BY player_id, snapped_at DESC;
-            """, (season_id,))
-            existing_snapshots = {
-                row[0]: {
-                    "status":  row[1],
-                    "news":    row[2],
-                    "cop_next": row[3],
-                    "cop_this": row[4],
-                }
-                for row in cur.fetchall()
-            }
- 
-            snapshot_records = []
-            for p in data.get("elements", []):
-                pid        = p.get("id")
-                new_status = p.get("status")
-                new_news   = p.get("news") or None   # normalise "" → None
-                new_next   = p.get("chance_of_playing_next_round")
-                new_this   = p.get("chance_of_playing_this_round")
- 
-                prev = existing_snapshots.get(pid)
-                changed = (
-                    prev is None                        # first snapshot ever
-                    or prev["status"]   != new_status
-                    or prev["news"]     != new_news
-                    or prev["cop_next"] != new_next
-                    or prev["cop_this"] != new_this
-                )
- 
-                if changed:
-                    snapshot_records.append((
-                        pid,
-                        season_id,
-                        # gw = current event at time of sync
-                        current_id,
-                        new_status,
-                        new_news,
-                        p.get("news_added"),
-                        new_next,
-                        new_this,
-                    ))
- 
-            if snapshot_records:
-                execute_values(cur, """
-                    INSERT INTO player_status_history (
-                        player_id, season_id, gw,
-                        status, news, news_added,
-                        chance_of_playing_next_round,
-                        chance_of_playing_this_round
-                    ) VALUES %s
-                    ON CONFLICT (player_id, season_id, snapped_at) DO NOTHING;
-                """, snapshot_records)
- 
-            counts["status_snapshots"] = len(snapshot_records)
-
-        # ── A) Add inside sync_bootstrap(), after the pl_teams execute_values block ──
- 
-            # Snapshot team strengths at the current GW.
-            # ON CONFLICT DO NOTHING so we only record each GW once —
-            # the first sync of that GW is the canonical snapshot.
-            gw_to_snap = current_id or next_id or 1
-            strength_snap_records = [
-                (
-                    t["id"], season_id, gw_to_snap,
-                    t.get("strength_attack_home"),
-                    t.get("strength_attack_away"),
-                    t.get("strength_defence_home"),
-                    t.get("strength_defence_away"),
-                )
-                for t in data.get("teams", [])
-                if t.get("strength_attack_home")  # skip teams with no strength data
-            ]
-            if strength_snap_records:
-                execute_values(cur, """
-                    INSERT INTO team_strength_history (
-                        team_id, season_id, gw,
-                        strength_attack_home,  strength_attack_away,
-                        strength_defence_home, strength_defence_away
-                    ) VALUES %s
-                    ON CONFLICT (team_id, season_id, gw) DO NOTHING;
-                """, strength_snap_records)
-                counts["strength_snapshots"] = len(strength_snap_records)
- 
         conn.commit()
- 
+
     return counts
 
 
-  ─────────────────────────────────────────────────────────────────────────────
-# ── B) New standalone function — add to sync.py ──────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
- 
+# ---------------------------------------------------------------------------
+# team_strength_history — manual snapshot / backfill
+# ---------------------------------------------------------------------------
+
 def sync_team_strengths(season_id: int, gw: int | None = None) -> dict:
     """
     Manually snapshot current FPL team strength values into team_strength_history.
- 
-    Use this to:
-      - Backfill historical GWs you missed (pass gw= explicitly)
-      - Force a snapshot at a specific GW (e.g. mid-season correction)
- 
+
+    Use this to backfill historical GWs you missed (pass gw= explicitly),
+    or to force a snapshot at a specific GW.
+
     If gw is None, uses current_event from the FPL game endpoint.
-    ON CONFLICT DO NOTHING — will not overwrite an existing snapshot for that GW.
+    ON CONFLICT DO NOTHING — safe to call multiple times for the same GW.
     """
     data       = fetch_bootstrap()
     game_state = fetch_game_state()
     snap_gw    = gw or game_state.get("current_event") or 1
- 
+
     records = [
         (
             t["id"], season_id, snap_gw,
@@ -441,7 +417,7 @@ def sync_team_strengths(season_id: int, gw: int | None = None) -> dict:
         for t in data.get("teams", [])
         if t.get("strength_attack_home")
     ]
- 
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             execute_values(cur, """
@@ -453,8 +429,10 @@ def sync_team_strengths(season_id: int, gw: int | None = None) -> dict:
                 ON CONFLICT (team_id, season_id, gw) DO NOTHING;
             """, records)
         conn.commit()
- 
+
     return {"gw": snap_gw, "teams_snapped": len(records)}
+
+
 # ---------------------------------------------------------------------------
 # fantasy_teams
 # ---------------------------------------------------------------------------
@@ -470,7 +448,7 @@ def sync_fantasy_teams(season_id: int) -> dict:
             e.get("player_first_name"), e.get("player_last_name"),
             e.get("short_name"), e.get("entry_name"),
             e.get("waiver_pick"), e.get("joined_time"),
-            e["id"],  # internal_team_id
+            e["id"],
         )
         for e in entries
     ]
@@ -537,9 +515,6 @@ def sync_fantasy_matches(season_id: int) -> dict:
 
 # ---------------------------------------------------------------------------
 # player_fantasy_status
-#
-# FIX: element-status API returns "owner" (not "entry") for the owning team.
-# "owner" = fantasy_teams.id (the large entry_id, e.g. 115464).
 # ---------------------------------------------------------------------------
 
 def sync_player_status(season_id: int) -> dict:
@@ -547,8 +522,6 @@ def sync_player_status(season_id: int) -> dict:
     data      = fetch_element_status(league_id)
     statuses  = data.get("element_status", [])
 
-    # API shape: {"element": 728, "in_accepted_trade": false, "owner": 115464, "status": "o"}
-    # "owner" maps to fantasy_teams.id (entry_id). Status "o"=owned, "a"=available.
     records = [
         (season_id, s["element"], s.get("owner"), s.get("status"))
         for s in statuses
@@ -791,8 +764,6 @@ def sync_lineups(season_id: int, gw: int) -> dict:
 
 # ---------------------------------------------------------------------------
 # standings
-# Rebuilt from fantasy_matches on each sync.
-# One row per team per GW — stores opponent, result, and cumulative points.
 # ---------------------------------------------------------------------------
 
 def sync_standings(season_id: int) -> dict:
@@ -890,9 +861,6 @@ def sync_draft_picks(season_id: int) -> dict:
 
 # ---------------------------------------------------------------------------
 # element_summary — per-fixture history + historical season totals
-#
-# FIX: Uses season name from DB (seasons.name) for current-season fixture rows,
-# so it matches what queries.py expects when filtering by season_name.
 # ---------------------------------------------------------------------------
 
 def _sync_element_summaries_for_players(player_ids: list, current_season_name: str) -> dict:
@@ -1022,7 +990,7 @@ def _sync_element_summaries_for_players(player_ids: list, current_season_name: s
 
 
 def sync_element_summaries(season_id: int) -> dict:
-    """Syncs per-fixture history for drafted players only (~90 players, ~10s)."""
+    """Syncs per-fixture history for drafted players only."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1041,10 +1009,7 @@ def sync_element_summaries(season_id: int) -> dict:
 
 
 def sync_all_element_summaries(season_id: int) -> dict:
-    """
-    Syncs per-fixture history for ALL players in the season (~700 players, ~70s).
-    Designed to run as a background task — do not call from a sync HTTP handler.
-    """
+    """Syncs per-fixture history for ALL players (~700, ~70s). Run as background task."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1064,11 +1029,7 @@ def sync_all_element_summaries(season_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# NEW: sync_pl_team_records
-# Derives W/D/L/points/position from the fixtures table.
-# The FPL bootstrap returns all zeros during the off-season so we compute
-# these ourselves from finished fixture scores.
-# Call after sync_fixtures().
+# sync_pl_team_records
 # ---------------------------------------------------------------------------
 
 def sync_pl_team_records(season_id: int) -> dict:
@@ -1137,10 +1098,7 @@ def sync_pl_team_records(season_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# NEW: sync_ownership_from_draft
-# Builds a complete per-GW ownership timeline from draft picks + transactions.
-# Creates/populates the player_ownership_history table.
-# Call after sync_draft_picks() and sync_transactions().
+# sync_ownership_from_draft
 # ---------------------------------------------------------------------------
 
 def sync_ownership_from_draft(season_id: int) -> dict:
@@ -1167,7 +1125,6 @@ def sync_ownership_from_draft(season_id: int) -> dict:
             """, (season_id,))
             max_gw = cur.fetchone()[0]
 
-            # Ensure table exists
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS player_ownership_history (
                     season_id  integer NOT NULL,
@@ -1186,28 +1143,24 @@ def sync_ownership_from_draft(season_id: int) -> dict:
             """)
         conn.commit()
 
-    # Build ownership timeline: draft picks set initial owner at GW1
-    ownership = {}  # player_id → (entry_id, from_gw)
+    ownership = {}
     for player_id, entry_id in draft_rows:
         ownership[player_id] = (entry_id, 1)
 
-    ownership_history = []  # (season_id, player_id, team_id, from_gw, to_gw)
+    ownership_history = []
 
     for player_in, player_out, gw, new_owner in tx_rows:
-        # Close out player leaving a team
         if player_out and player_out in ownership:
             old_owner, old_from = ownership[player_out]
             ownership_history.append((season_id, player_out, old_owner, old_from, gw - 1))
             del ownership[player_out]
 
-        # Open new ownership for incoming player
         if player_in:
             if player_in in ownership:
                 old_owner, old_from = ownership[player_in]
                 ownership_history.append((season_id, player_in, old_owner, old_from, gw - 1))
             ownership[player_in] = (new_owner, gw)
 
-    # Close remaining open ownerships at end of season
     for player_id, (entry_id, from_gw) in ownership.items():
         ownership_history.append((season_id, player_id, entry_id, from_gw, max_gw))
 
