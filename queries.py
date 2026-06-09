@@ -1345,14 +1345,30 @@ def get_transfer_analytics(season_id: int):
             """, (season_id,))
             all_fixtures = cur.fetchall()
 
+            # Strength values — use team_strength_history (per-GW snapshots).
+            # This correctly handles relegated/promoted teams and seasonal changes.
+            # Falls back to premier_league_teams if history table has no data yet.
             cur.execute("""
-                SELECT id,
+                SELECT DISTINCT ON (team_id)
+                    team_id                AS id,
                     strength_attack_home,  strength_attack_away,
                     strength_defence_home, strength_defence_away
-                FROM premier_league_teams
-                WHERE season_id = %s;
+                FROM team_strength_history
+                WHERE season_id = %s
+                ORDER BY team_id, gw DESC;
             """, (season_id,))
             strength_rows = cur.fetchall()
+
+            if not strength_rows:
+                # Fallback: use the current snapshot from premier_league_teams
+                cur.execute("""
+                    SELECT id,
+                        strength_attack_home,  strength_attack_away,
+                        strength_defence_home, strength_defence_away
+                    FROM premier_league_teams
+                    WHERE season_id = %s;
+                """, (season_id,))
+                strength_rows = cur.fetchall()
 
     # ── Build lookup structures ───────────────────────────────────────────────
     flag_map: dict = {}
@@ -1733,15 +1749,33 @@ def get_transfer_stats(season_id: int):
             """, (season_id,))
             all_fixture_rows = cur.fetchall()
 
-            # Team strength values for FDR calculation
+            # Team strengths — from team_strength_history (archived per-GW snapshots).
+            # DISTINCT ON team_id gives us the most recent snapshot per team.
+            # Returns (team_id, short_name, atk_h, atk_a, def_h, def_a).
             cur.execute("""
-                SELECT id, short_name,
-                    strength_attack_home,  strength_attack_away,
-                    strength_defence_home, strength_defence_away
-                FROM premier_league_teams
-                WHERE season_id = %s;
+                SELECT DISTINCT ON (tsh.team_id)
+                    tsh.team_id,
+                    plt.short_name,
+                    tsh.strength_attack_home,  tsh.strength_attack_away,
+                    tsh.strength_defence_home, tsh.strength_defence_away
+                FROM team_strength_history tsh
+                JOIN premier_league_teams plt
+                    ON plt.id = tsh.team_id AND plt.season_id = tsh.season_id
+                WHERE tsh.season_id = %s
+                ORDER BY tsh.team_id, tsh.gw DESC;
             """, (season_id,))
             team_strength_rows = cur.fetchall()
+
+            if not team_strength_rows:
+                # Fallback: current premier_league_teams snapshot
+                cur.execute("""
+                    SELECT id, short_name,
+                        strength_attack_home,  strength_attack_away,
+                        strength_defence_home, strength_defence_away
+                    FROM premier_league_teams
+                    WHERE season_id = %s;
+                """, (season_id,))
+                team_strength_rows = cur.fetchall()
 
     # ── Reshape ───────────────────────────────────────────────────────────────
     # Squad slot counts for normalisation: GKP=2, DEF=5, MID=5, FWD=3
