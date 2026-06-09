@@ -1275,70 +1275,66 @@ def get_transfer_analytics(season_id: int):
                     gw_pts.setdefault(pid, {})[gw] = pts
 
             # ── Ownership windows: when was player_in actually held? ──────────
-            # For each transfer, find the GW range the incoming player was owned
-            # by this fantasy team, so we can compute a fair pts-per-GW delta
-            # over only the weeks they were actually held.
-            ownership_windows: dict = {}   # {tx_id: {from_gw, to_gw}}
+            # Fetch all ownership spans for the relevant player+team combinations,
+            # then match in Python. Uses ANY() arrays — no string interpolation.
+            ownership_windows: dict = {}
             if transfers_raw:
-                # Batch query: for each (team_id, player_in_id, transfer_gw) triple
-                # find the ownership span that starts at or after the transfer GW.
-                # We use player_ownership_history (from_gw / to_gw).
-                # Fallback: scan gameweek_lineups for first/last appearance.
-                tx_params = [
-                    (t["id"], t["fantasy_team_id"], t["player_in_id"], t["gw"])
-                    for t in transfers_raw
-                ]
-                # Ownership history approach — one row per ownership span
+                in_player_ids = list({t["player_in_id"]   for t in transfers_raw})
+                in_team_ids   = list({t["fantasy_team_id"] for t in transfers_raw})
+
                 cur.execute("""
-                    SELECT req.tx_id, poh.from_gw, poh.to_gw
-                    FROM (VALUES %s) AS req(tx_id, team_id, player_id, transfer_gw)
-                    JOIN player_ownership_history poh
-                        ON poh.player_id  = req.player_id
-                        AND poh.team_id   = req.team_id
-                        AND poh.season_id = %s
-                        AND poh.from_gw  >= req.transfer_gw
-                    ORDER BY req.tx_id, poh.from_gw
-                """ % (
-                    "(" + "),(".join(
-                        cur.mogrify("%s,%s,%s,%s", p).decode() for p in tx_params
-                    ) + ")",
-                ), (season_id,))
-                for tx_id, from_gw, to_gw in cur.fetchall():
-                    if tx_id not in ownership_windows:
-                        ownership_windows[tx_id] = {
-                            "from_gw": from_gw,
-                            "to_gw":   to_gw or max_gw_db,
+                    SELECT poh.player_id, poh.team_id, poh.from_gw, poh.to_gw
+                    FROM player_ownership_history poh
+                    WHERE poh.season_id = %s
+                      AND poh.player_id = ANY(%s)
+                      AND poh.team_id   = ANY(%s)
+                    ORDER BY poh.player_id, poh.team_id, poh.from_gw;
+                """, (season_id, in_player_ids, in_team_ids))
+
+                poh_index: dict = {}
+                for pid, tid, fg, tg in cur.fetchall():
+                    poh_index.setdefault((pid, tid), []).append((fg, tg or max_gw_db))
+
+                for t in transfers_raw:
+                    key   = (t["player_in_id"], t["fantasy_team_id"])
+                    spans = poh_index.get(key, [])
+                    match = next(
+                        ((fg, tg) for fg, tg in spans if fg >= t["gw"]),
+                        None
+                    )
+                    if match:
+                        ownership_windows[t["id"]] = {
+                            "from_gw": match[0],
+                            "to_gw":   match[1],
                         }
 
-                # For any transfer not covered by ownership history, fall back to
-                # gameweek_lineups: find first and last GW the player appeared for
-                # this team after the transfer GW.
-                missing = [t for t in transfers_raw if t["id"] not in ownership_windows]
-                if missing:
-                    miss_params = [
-                        (t["id"], t["fantasy_team_id"], t["player_in_id"], t["gw"])
-                        for t in missing
-                    ]
+                # Fallback: gameweek_lineups for any transfer not covered
+                missing_ids = [t for t in transfers_raw if t["id"] not in ownership_windows]
+                if missing_ids:
+                    miss_player_ids = list({t["player_in_id"]   for t in missing_ids})
+                    miss_team_ids   = list({t["fantasy_team_id"] for t in missing_ids})
+
                     cur.execute("""
-                        SELECT req.tx_id, MIN(gl.gw) AS first_gw, MAX(gl.gw) AS last_gw
-                        FROM (VALUES %s) AS req(tx_id, team_id, player_id, transfer_gw)
-                        JOIN gameweek_lineups gl
-                            ON gl.player_id  = req.player_id
-                            AND gl.team_id   = req.team_id
-                            AND gl.season_id = %s
-                            AND gl.gw       >= req.transfer_gw
-                            AND gl.position <= 15
-                        GROUP BY req.tx_id
-                    """ % (
-                        "(" + "),(".join(
-                            cur.mogrify("%s,%s,%s,%s", p).decode() for p in miss_params
-                        ) + ")",
-                    ), (season_id,))
-                    for tx_id, first_gw, last_gw in cur.fetchall():
-                        ownership_windows[tx_id] = {
-                            "from_gw": first_gw,
-                            "to_gw":   last_gw,
-                        }
+                        SELECT gl.player_id, gl.team_id,
+                               MIN(gl.gw) AS first_gw, MAX(gl.gw) AS last_gw
+                        FROM gameweek_lineups gl
+                        WHERE gl.season_id = %s
+                          AND gl.player_id = ANY(%s)
+                          AND gl.team_id   = ANY(%s)
+                          AND gl.position <= 15
+                        GROUP BY gl.player_id, gl.team_id;
+                    """, (season_id, miss_player_ids, miss_team_ids))
+
+                    gl_index = {(r[0], r[1]): (r[2], r[3]) for r in cur.fetchall()}
+
+                    for t in missing_ids:
+                        key   = (t["player_in_id"], t["fantasy_team_id"])
+                        match = gl_index.get(key)
+                        if match and match[0] >= t["gw"]:
+                            ownership_windows[t["id"]] = {
+                                "from_gw": match[0],
+                                "to_gw":   match[1],
+                            }
 
             # ── Fixtures + strengths for FDR smart score ──────────────────────
             cur.execute("""
