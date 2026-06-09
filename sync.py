@@ -382,7 +382,77 @@ def sync_bootstrap(season_id: int) -> dict:
  
     return counts
 
-
+# ── A) Add inside sync_bootstrap(), after the pl_teams execute_values block ──
+ 
+            # Snapshot team strengths at the current GW.
+            # ON CONFLICT DO NOTHING so we only record each GW once —
+            # the first sync of that GW is the canonical snapshot.
+            gw_to_snap = current_id or next_id or 1
+            strength_snap_records = [
+                (
+                    t["id"], season_id, gw_to_snap,
+                    t.get("strength_attack_home"),
+                    t.get("strength_attack_away"),
+                    t.get("strength_defence_home"),
+                    t.get("strength_defence_away"),
+                )
+                for t in data.get("teams", [])
+                if t.get("strength_attack_home")  # skip teams with no strength data
+            ]
+            if strength_snap_records:
+                execute_values(cur, """
+                    INSERT INTO team_strength_history (
+                        team_id, season_id, gw,
+                        strength_attack_home,  strength_attack_away,
+                        strength_defence_home, strength_defence_away
+                    ) VALUES %s
+                    ON CONFLICT (team_id, season_id, gw) DO NOTHING;
+                """, strength_snap_records)
+                counts["strength_snapshots"] = len(strength_snap_records)
+  ─────────────────────────────────────────────────────────────────────────────
+# ── B) New standalone function — add to sync.py ──────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def sync_team_strengths(season_id: int, gw: int | None = None) -> dict:
+    """
+    Manually snapshot current FPL team strength values into team_strength_history.
+ 
+    Use this to:
+      - Backfill historical GWs you missed (pass gw= explicitly)
+      - Force a snapshot at a specific GW (e.g. mid-season correction)
+ 
+    If gw is None, uses current_event from the FPL game endpoint.
+    ON CONFLICT DO NOTHING — will not overwrite an existing snapshot for that GW.
+    """
+    data       = fetch_bootstrap()
+    game_state = fetch_game_state()
+    snap_gw    = gw or game_state.get("current_event") or 1
+ 
+    records = [
+        (
+            t["id"], season_id, snap_gw,
+            t.get("strength_attack_home"),
+            t.get("strength_attack_away"),
+            t.get("strength_defence_home"),
+            t.get("strength_defence_away"),
+        )
+        for t in data.get("teams", [])
+        if t.get("strength_attack_home")
+    ]
+ 
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO team_strength_history (
+                    team_id, season_id, gw,
+                    strength_attack_home,  strength_attack_away,
+                    strength_defence_home, strength_defence_away
+                ) VALUES %s
+                ON CONFLICT (team_id, season_id, gw) DO NOTHING;
+            """, records)
+        conn.commit()
+ 
+    return {"gw": snap_gw, "teams_snapped": len(records)}
 # ---------------------------------------------------------------------------
 # fantasy_teams
 # ---------------------------------------------------------------------------
