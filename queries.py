@@ -1614,6 +1614,25 @@ def get_transfer_stats(season_id: int):
             """, (season_id, season_id))
             gw_team_rows = cur.fetchall()
 
+            # All fixtures (full season) for FDR colouring in club activity chart
+            cur.execute("""
+                SELECT gw, team_h, team_a
+                FROM fixtures
+                WHERE season_id = %s
+                ORDER BY gw;
+            """, (season_id,))
+            all_fixture_rows = cur.fetchall()
+
+            # Team strength values for FDR calculation
+            cur.execute("""
+                SELECT id, short_name,
+                    strength_attack_home,  strength_attack_away,
+                    strength_defence_home, strength_defence_away
+                FROM premier_league_teams
+                WHERE season_id = %s;
+            """, (season_id,))
+            team_strength_rows = cur.fetchall()
+
     # ── Reshape ───────────────────────────────────────────────────────────────
     # Squad slot counts for normalisation: GKP=2, DEF=5, MID=5, FWD=3
     SQUAD_SLOTS = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
@@ -1698,6 +1717,23 @@ def get_transfer_stats(season_id: int):
         "by_gw_team": [
             {"gw": r[0], "pl_team": r[1], "direction": r[2], "count": r[3]}
             for r in gw_team_rows
+        ],
+        # Full fixture list + strengths so frontend can compute position-aware FDR
+        # for any historical GW (not just upcoming fixtures)
+        "all_fixtures": [
+            {"gw": r[0], "team_h": r[1], "team_a": r[2]}
+            for r in all_fixture_rows
+        ],
+        "team_strengths": [
+            {
+                "id":        r[0],
+                "short_name": r[1],
+                "atk_h":     r[2],
+                "atk_a":     r[3],
+                "def_h":     r[4],
+                "def_a":     r[5],
+            }
+            for r in team_strength_rows
         ],
     }
 
