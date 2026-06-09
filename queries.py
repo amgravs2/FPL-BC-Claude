@@ -1697,6 +1697,57 @@ def get_transfer_stats(season_id: int):
         }
         for r in regret_rows
     ]
+    # ─────────────────────────────────────────────────────────────────────────────
+# ADD these two queries inside get_transfer_stats(), before the final return.
+# They add by_gw_position and by_gw_team to the response payload.
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+            # ── Transfers by GW × position (for stacked area chart) ────────────
+            cur.execute("""
+                SELECT
+                    tx.gw,
+                    et_in.singular_name_short AS position,
+                    COUNT(*) AS count
+                FROM transactions tx
+                JOIN players p_in ON p_in.id = tx.player_in_id
+                JOIN element_type et_in ON et_in.id = p_in.position
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY tx.gw, et_in.singular_name_short
+                ORDER BY tx.gw, et_in.singular_name_short;
+            """, (season_id,))
+            gw_pos_rows = cur.fetchall()
+ 
+            # ── Transfers by GW × PL team × direction (for club activity chart) ─
+            cur.execute("""
+                SELECT
+                    tx.gw,
+                    plt.short_name AS pl_team,
+                    'in'           AS direction,
+                    COUNT(*)       AS count
+                FROM transactions tx
+                JOIN players p_in ON p_in.id = tx.player_in_id
+                JOIN premier_league_teams plt
+                    ON plt.id = p_in.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY tx.gw, plt.short_name
+ 
+                UNION ALL
+ 
+                SELECT
+                    tx.gw,
+                    plt.short_name AS pl_team,
+                    'out'          AS direction,
+                    COUNT(*)       AS count
+                FROM transactions tx
+                JOIN players p_out ON p_out.id = tx.player_out_id
+                JOIN premier_league_teams plt
+                    ON plt.id = p_out.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY tx.gw, plt.short_name
+ 
+                ORDER BY gw, pl_team, direction;
+            """, (season_id, season_id))
+            gw_team_rows = cur.fetchall()
 
     return {
         "by_position": [
@@ -1714,6 +1765,14 @@ def get_transfer_stats(season_id: int):
         "by_gw":        by_gw,
         "busiest_gw":   busiest,
         "regret_board": regret_board,
+                "by_gw_position": [
+            {"gw": r[0], "position": r[1], "count": r[2]}
+            for r in gw_pos_rows
+        ],
+        "by_gw_team": [
+            {"gw": r[0], "pl_team": r[1], "direction": r[2], "count": r[3]}
+            for r in gw_team_rows
+        ],
     }
 # ---------------------------------------------------------------------------
 # Fixtures upcoming
