@@ -134,8 +134,22 @@ def sync_bootstrap(season_id: int) -> dict:
             counts["pl_teams"] = len(pl_records)
 
             # 2a. Snapshot team strengths at the current GW.
-            # ON CONFLICT DO NOTHING — first sync of each GW wins, no overwrites.
+            # Guard: only write teams that already exist in premier_league_teams
+            # for this season — prevents off-season bootstrap (which returns the
+            # NEW season's 20 teams) from polluting a completed season's records.
+            # ON CONFLICT DO NOTHING — first sync of each GW wins.
             gw_to_snap = current_id or next_id or 1
+            bootstrap_team_ids = {t["id"] for t in data.get("teams", [])}
+
+            cur.execute(
+                "SELECT id FROM premier_league_teams WHERE season_id = %s;",
+                (season_id,)
+            )
+            existing_team_ids = {r[0] for r in cur.fetchall()}
+
+            # Only snap teams that belong to THIS season
+            valid_team_ids = bootstrap_team_ids & existing_team_ids
+
             strength_snap_records = [
                 (
                     t["id"], season_id, gw_to_snap,
@@ -145,7 +159,8 @@ def sync_bootstrap(season_id: int) -> dict:
                     t.get("strength_defence_away"),
                 )
                 for t in data.get("teams", [])
-                if t.get("strength_attack_home")
+                if t["id"] in valid_team_ids
+                and t.get("strength_attack_home")
             ]
             if strength_snap_records:
                 execute_values(cur, """
@@ -156,7 +171,7 @@ def sync_bootstrap(season_id: int) -> dict:
                     ) VALUES %s
                     ON CONFLICT (team_id, season_id, gw) DO NOTHING;
                 """, strength_snap_records)
-                counts["strength_snapshots"] = len(strength_snap_records)
+            counts["strength_snapshots"] = len(strength_snap_records)
 
             # 3. players
             p_records = [
@@ -395,30 +410,39 @@ def sync_bootstrap(season_id: int) -> dict:
 def sync_team_strengths(season_id: int, gw: int | None = None) -> dict:
     """
     Manually snapshot current FPL team strength values into team_strength_history.
-
-    Use this to backfill historical GWs you missed (pass gw= explicitly),
-    or to force a snapshot at a specific GW.
-
-    If gw is None, uses current_event from the FPL game endpoint.
+    Only writes teams that already exist in premier_league_teams for this season,
+    so off-season syncs don't pollute historical season records.
     ON CONFLICT DO NOTHING — safe to call multiple times for the same GW.
     """
     data       = fetch_bootstrap()
     game_state = fetch_game_state()
     snap_gw    = gw or game_state.get("current_event") or 1
 
-    records = [
-        (
-            t["id"], season_id, snap_gw,
-            t.get("strength_attack_home"),
-            t.get("strength_attack_away"),
-            t.get("strength_defence_home"),
-            t.get("strength_defence_away"),
-        )
-        for t in data.get("teams", [])
-        if t.get("strength_attack_home")
-    ]
+    bootstrap_team_ids = {t["id"] for t in data.get("teams", [])}
 
     with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM premier_league_teams WHERE season_id = %s;",
+                (season_id,)
+            )
+            existing_team_ids = {r[0] for r in cur.fetchall()}
+
+        valid_team_ids = bootstrap_team_ids & existing_team_ids
+
+        records = [
+            (
+                t["id"], season_id, snap_gw,
+                t.get("strength_attack_home"),
+                t.get("strength_attack_away"),
+                t.get("strength_defence_home"),
+                t.get("strength_defence_away"),
+            )
+            for t in data.get("teams", [])
+            if t["id"] in valid_team_ids
+            and t.get("strength_attack_home")
+        ]
+
         with conn.cursor() as cur:
             execute_values(cur, """
                 INSERT INTO team_strength_history (
@@ -430,7 +454,7 @@ def sync_team_strengths(season_id: int, gw: int | None = None) -> dict:
             """, records)
         conn.commit()
 
-    return {"gw": snap_gw, "teams_snapped": len(records)}
+    return {"gw": snap_gw, "teams_snapped": len(records), "skipped_wrong_season": len(bootstrap_team_ids) - len(valid_team_ids)}
 
 
 # ---------------------------------------------------------------------------
