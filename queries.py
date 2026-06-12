@@ -934,123 +934,669 @@ def get_player_stats(season_id: int):
     ]
 
 
-# ---------------------------------------------------------------------------
-# Transfer analytics
-# ---------------------------------------------------------------------------
-
-# ── REPLACEMENT for get_transfer_analytics() in queries.py ──
-# Two changes from the previous version:
-#   1. CTE now selects ft.id AS fpl_team_id (added after manager name)
-#   2. Row indices shifted by 1 from r[2] onward; team_id now uses fpl_team_id (ft.id)
-#      so it matches the managerMap keys built from the summary endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+# Transfer endpoints — drop these into queries.py replacing
+# get_transfer_analytics() and adding get_transfer_stats().
+#
+# get_transfer_analytics()  → GET /season/{id}/transfers
+# get_transfer_stats()      → GET /season/{id}/transfer-stats
+# ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/season/{season_id}/transfers")
 def get_transfer_analytics(season_id: int):
     """
-    Transfer activity per manager with post-transfer point delta.
-    Delta = points scored by player_in after transfer GW
-            minus points scored by player_out after transfer GW.
+    Enriched transfer list + manager summary with hit rate.
+
+    Each transfer row contains:
+      web_name_in/out, pos_in/out, team_in/out, delta (full-season after GW),
+      delta_window (points during actual ownership window), delta_per_gw,
+      gws_held, pts_in_window, pts_out_window, ownership_from/to,
+      window_is_full_season, smart_score (FDR fixture quality of swap),
+      fdr_in/out (avg FDR next 3 GWs at time of transfer),
+      flag_in/out (injury flag at transfer time from player_status_history),
+      chart_gw_points (dict gw → {in, out} for the mini line chart).
+
+    manager_summary adds hit_rate (% of transfers with delta > 0).
+    best/worst_transfer_pgw are ranked by delta_per_gw, not raw delta.
     """
     _season_or_404(season_id)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
+
+            # ── 1. Core transfer rows with enriched player metadata ──────────
             cur.execute("""
-                WITH transfer_deltas AS (
-                    SELECT
-                        tx.id,
-                        ft.player_first_name AS manager,
-                        ft.id                AS fpl_team_id,
-                        ft.internal_team_id,
-                        tx.gw,
-                        tx.kind,
-                        tx.result,
-                        p_in.first_name  || ' ' || p_in.second_name  AS player_in,
-                        p_out.first_name || ' ' || p_out.second_name AS player_out,
-                        tx.player_in_id,
-                        tx.player_out_id,
-                        COALESCE((
-                            SELECT SUM(pgs.total_points)
-                            FROM player_gameweek_stats pgs
-                            WHERE pgs.player_id = tx.player_in_id
-                              AND pgs.season_id = tx.season_id
-                              AND pgs.gw > tx.gw
-                        ), 0) AS points_in_after,
-                        COALESCE((
-                            SELECT SUM(pgs.total_points)
-                            FROM player_gameweek_stats pgs
-                            WHERE pgs.player_id = tx.player_out_id
-                              AND pgs.season_id = tx.season_id
-                              AND pgs.gw > tx.gw
-                        ), 0) AS points_out_after
-                    FROM transactions tx
-                    JOIN fantasy_teams ft
-                        ON ft.id = tx.team_id
-                        AND ft.season_id = tx.season_id
-                    JOIN players p_in
-                        ON p_in.id = tx.player_in_id
-                        AND p_in.season_id = tx.season_id
-                    JOIN players p_out
-                        ON p_out.id = tx.player_out_id
-                        AND p_out.season_id = tx.season_id
-                    WHERE tx.season_id = %s AND tx.result = 'a'
-                )
-                SELECT *,
-                    (points_in_after - points_out_after) AS delta
-                FROM transfer_deltas
-                ORDER BY delta DESC;
+                SELECT
+                    tx.id,
+                    ft.id                              AS fpl_team_id,
+                    ft.player_first_name               AS manager,
+                    tx.gw,
+                    tx.kind,
+                    -- player IN
+                    p_in.id                            AS player_in_id,
+                    p_in.web_name                      AS web_name_in,
+                    et_in.singular_name_short          AS pos_in,
+                    plt_in.short_name                  AS team_in,
+                    p_in.team                          AS team_in_id,
+                    -- player OUT
+                    p_out.id                           AS player_out_id,
+                    p_out.web_name                     AS web_name_out,
+                    et_out.singular_name_short         AS pos_out,
+                    plt_out.short_name                 AS team_out,
+                    p_out.team                         AS team_out_id
+                FROM transactions tx
+                JOIN fantasy_teams ft
+                    ON ft.id = tx.team_id AND ft.season_id = tx.season_id
+                JOIN players p_in
+                    ON p_in.id = tx.player_in_id AND p_in.season_id = tx.season_id
+                JOIN players p_out
+                    ON p_out.id = tx.player_out_id AND p_out.season_id = tx.season_id
+                JOIN element_type et_in  ON et_in.id  = p_in.position
+                JOIN element_type et_out ON et_out.id = p_out.position
+                LEFT JOIN premier_league_teams plt_in
+                    ON plt_in.id = p_in.team AND plt_in.season_id = tx.season_id
+                LEFT JOIN premier_league_teams plt_out
+                    ON plt_out.id = p_out.team AND plt_out.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                ORDER BY tx.gw, tx.id;
             """, (season_id,))
-            rows = cur.fetchall()
+            raw_rows = cur.fetchall()
 
-    # Column order: id, manager, fpl_team_id, internal_team_id, gw, kind, result,
-    #               player_in, player_out, player_in_id, player_out_id,
-    #               points_in_after, points_out_after, delta
-    transfers = [
-        {
-            "id":               r[0],
-            "manager":          r[1],
-            "team_id":          r[2],   # ft.id — matches managerMap keys from summary
-            "gw":               r[4],
-            "kind":             r[5],
-            "result":           r[6],
-            "player_in":        r[7],
-            "player_out":       r[8],
-            "player_in_id":     r[9],
-            "player_out_id":    r[10],
-            "points_in_after":  r[11],
-            "points_out_after": r[12],
-            "delta":            r[13],
+            # ── 2. Per-player GW stats (for delta and chart) ─────────────────
+            cur.execute("""
+                SELECT player_id, gw, total_points
+                FROM player_gameweek_stats
+                WHERE season_id = %s
+                ORDER BY player_id, gw;
+            """, (season_id,))
+            gw_stats_rows = cur.fetchall()
+
+            # ── 3. Ownership windows (to compute ownership-window delta) ─────
+            cur.execute("""
+                SELECT player_id, team_id, from_gw, to_gw
+                FROM player_ownership_history
+                WHERE season_id = %s;
+            """, (season_id,))
+            ownership_rows = cur.fetchall()
+
+            # ── 4. Team strength history for FDR at transfer time ────────────
+            cur.execute("""
+                SELECT DISTINCT ON (team_id)
+                    team_id, gw,
+                    strength_attack_home,  strength_attack_away,
+                    strength_defence_home, strength_defence_away
+                FROM team_strength_history
+                WHERE season_id = %s
+                ORDER BY team_id, gw DESC;
+            """, (season_id,))
+            strength_rows = cur.fetchall()
+
+            # ── 5. Fixtures for FDR (next 3 GWs after each transfer) ─────────
+            cur.execute("""
+                SELECT gw, team_h, team_a
+                FROM fixtures
+                WHERE season_id = %s
+                ORDER BY gw;
+            """, (season_id,))
+            fixture_rows = cur.fetchall()
+
+            # ── 6. Player status history for archived flags ──────────────────
+            cur.execute("""
+                SELECT player_id, gw, status, chance_of_playing_next_round, news
+                FROM player_status_history
+                WHERE season_id = %s;
+            """, (season_id,))
+            flag_rows = cur.fetchall()
+
+    # ── Build lookup structures ──────────────────────────────────────────────
+
+    # gw points: {player_id: {gw: pts}}
+    gw_pts: dict = {}
+    for player_id, gw, pts in gw_stats_rows:
+        if player_id not in gw_pts:
+            gw_pts[player_id] = {}
+        gw_pts[player_id][gw] = int(pts)
+
+    # ownership windows: {player_id: [(team_id, from_gw, to_gw)]}
+    ownership_map: dict = {}
+    for player_id, team_id, from_gw, to_gw in ownership_rows:
+        if player_id not in ownership_map:
+            ownership_map[player_id] = []
+        ownership_map[player_id].append((team_id, from_gw, to_gw or 38))
+
+    # strength map: {team_id: {atk_h, atk_a, def_h, def_a}}
+    strength_map = {
+        row[0]: {
+            "atk_h": row[2], "atk_a": row[3],
+            "def_h": row[4], "def_a": row[5],
         }
-        for r in rows
-    ]
+        for row in strength_rows
+    }
 
-    managers: dict = {}
+    # fixtures by GW: {gw: [(team_h, team_a)]}
+    fixtures_by_gw: dict = {}
+    for gw, team_h, team_a in fixture_rows:
+        if gw not in fixtures_by_gw:
+            fixtures_by_gw[gw] = []
+        fixtures_by_gw[gw].append((team_h, team_a))
+
+    # flags: {player_id: [(gw, status, chance, news)]} sorted by gw desc
+    flags_map: dict = {}
+    for player_id, gw, status, chance, news in flag_rows:
+        if player_id not in flags_map:
+            flags_map[player_id] = []
+        flags_map[player_id].append((gw, status, chance, news))
+    for pid in flags_map:
+        flags_map[pid].sort(key=lambda x: x[0], reverse=True)
+
+    # league-wide strength averages for FDR scale
+    all_atk_a = [v["atk_a"] for v in strength_map.values() if v["atk_a"]]
+    all_def_a = [v["def_a"] for v in strength_map.values() if v["def_a"]]
+    all_atk_h = [v["atk_h"] for v in strength_map.values() if v["atk_h"]]
+    all_def_h = [v["def_h"] for v in strength_map.values() if v["def_h"]]
+    avg_atk_a = sum(all_atk_a) / len(all_atk_a) if all_atk_a else 1200
+    avg_def_a = sum(all_def_a) / len(all_def_a) if all_def_a else 1200
+    avg_atk_h = sum(all_atk_h) / len(all_atk_h) if all_atk_h else 1200
+    avg_def_h = sum(all_def_h) / len(all_def_h) if all_def_h else 1200
+
+    def _fdr_scale(raw, avg):
+        if not raw or not avg:
+            return 3
+        r = raw / avg
+        if r < 0.87: return 2
+        if r < 1.07: return 3
+        if r < 1.17: return 4
+        return 5
+
+    def _avg_fdr_next_n(team_id, from_gw, n, position):
+        """Average FDR for team over next n GWs from from_gw. Position-aware."""
+        fdrs = []
+        checked = 0
+        gw = from_gw + 1
+        while checked < n and gw <= 38:
+            for t_h, t_a in fixtures_by_gw.get(gw, []):
+                if t_h == team_id or t_a == team_id:
+                    is_home = t_h == team_id
+                    opp_id  = t_a if is_home else t_h
+                    opp     = strength_map.get(opp_id, {})
+                    if position in ("GKP", "DEF"):
+                        # difficulty keeping clean sheet = opp attack
+                        raw = opp.get("atk_a") if is_home else opp.get("atk_h")
+                        avg = avg_atk_a if is_home else avg_atk_h
+                    else:
+                        # difficulty scoring = opp defence
+                        raw = opp.get("def_a") if is_home else opp.get("def_h")
+                        avg = avg_def_a if is_home else avg_def_h
+                    fdrs.append(_fdr_scale(raw, avg))
+                    checked += 1
+                    break
+            gw += 1
+        return round(sum(fdrs) / len(fdrs), 1) if fdrs else None
+
+    def _get_flag(player_id, at_gw):
+        """Return the most recent flag snapshot at or before at_gw."""
+        for snap_gw, status, chance, news in flags_map.get(player_id, []):
+            if snap_gw <= at_gw and status not in ("a", None):
+                level = None
+                if chance == 0:       level = "0%"
+                elif chance is not None and chance <= 25: level = "25%"
+                elif chance is not None and chance <= 50: level = "50%"
+                elif chance is not None and chance <= 75: level = "75%"
+                elif status == "i":   level = "INJ"
+                elif status == "s":   level = "SUS"
+                elif status == "d":   level = "DTB"
+                if level:
+                    return {"level": level, "news": news or ""}
+        return None
+
+    def _ownership_window(player_id, team_id, transfer_gw):
+        """
+        Find the ownership window for player_id at team_id starting around transfer_gw.
+        Returns (from_gw, to_gw, is_full_season).
+        """
+        windows = ownership_map.get(player_id, [])
+        # find the window for this team closest to the transfer GW
+        best = None
+        for tid, from_gw, to_gw in windows:
+            if tid == team_id and from_gw >= transfer_gw - 2:
+                if best is None or abs(from_gw - transfer_gw) < abs(best[0] - transfer_gw):
+                    best = (from_gw, to_gw)
+        if best:
+            return best[0], best[1], False
+        # no ownership history found — use full season from transfer_gw
+        last_gw = max(gw_pts.get(player_id, {transfer_gw: transfer_gw}).keys(), default=transfer_gw)
+        return transfer_gw + 1, last_gw, True
+
+    # ── Build enriched transfer list ─────────────────────────────────────────
+    transfers = []
+    for row in raw_rows:
+        (tx_id, fpl_team_id, manager, gw, kind,
+         pid_in,  wn_in,  pos_in,  team_in,  tid_in,
+         pid_out, wn_out, pos_out, team_out, tid_out) = row
+
+        # Full-season delta (points in minus points out, after transfer GW)
+        pts_in_full  = sum(v for g, v in gw_pts.get(pid_in,  {}).items() if g > gw)
+        pts_out_full = sum(v for g, v in gw_pts.get(pid_out, {}).items() if g > gw)
+        delta_full   = int(pts_in_full - pts_out_full)
+
+        # Ownership-window delta
+        own_from, own_to, is_full = _ownership_window(pid_in, fpl_team_id, gw)
+        pts_in_win  = sum(v for g, v in gw_pts.get(pid_in,  {}).items() if own_from <= g <= own_to)
+        pts_out_win = sum(v for g, v in gw_pts.get(pid_out, {}).items() if own_from <= g <= own_to)
+        delta_win   = int(pts_in_win - pts_out_win)
+        gws_held    = max(own_to - own_from + 1, 1)
+        delta_pgw   = round(delta_win / gws_held, 1)
+
+        # FDR at transfer time (avg next 3 GWs)
+        fdr_in  = _avg_fdr_next_n(tid_in,  gw, 3, pos_in)
+        fdr_out = _avg_fdr_next_n(tid_out, gw, 3, pos_out)
+
+        # Smart score: improvement in fixture quality (negative = better for GKP/DEF)
+        smart_score = None
+        if fdr_in is not None and fdr_out is not None:
+            # For attacking positions: lower FDR out = harder to score, lower FDR in = easier = good
+            # For defensive: lower FDR in = harder CS, so we want fdr_in < fdr_out
+            # Smart score = fdr_out - fdr_in (positive = brought in better fixtures)
+            smart_score = round(fdr_out - fdr_in, 1)
+
+        # Archived flags
+        flag_in  = _get_flag(pid_in,  gw)
+        flag_out = _get_flag(pid_out, gw)
+
+        # GW-by-GW points chart data
+        all_gws = sorted(set(
+            list(gw_pts.get(pid_in,  {}).keys()) +
+            list(gw_pts.get(pid_out, {}).keys())
+        ))
+        chart_gw_points = {
+            g: {
+                "in":  gw_pts.get(pid_in,  {}).get(g, 0),
+                "out": gw_pts.get(pid_out, {}).get(g, 0),
+            }
+            for g in all_gws if g > gw
+        }
+
+        transfers.append({
+            "id":                  tx_id,
+            "team_id":             fpl_team_id,
+            "manager":             manager,
+            "gw":                  gw,
+            "kind":                kind,
+            # player fields
+            "player_in_id":        pid_in,
+            "web_name_in":         wn_in,
+            "pos_in":              pos_in,
+            "team_in":             team_in,
+            "player_out_id":       pid_out,
+            "web_name_out":        wn_out,
+            "pos_out":             pos_out,
+            "team_out":            team_out,
+            # deltas
+            "delta":               delta_full,
+            "points_in_after":     int(pts_in_full),
+            "points_out_after":    int(pts_out_full),
+            # ownership-window metrics
+            "delta_window":        delta_win,
+            "delta_per_gw":        delta_pgw,
+            "gws_held":            gws_held,
+            "pts_in_window":       int(pts_in_win),
+            "pts_out_window":      int(pts_out_win),
+            "ownership_from":      own_from,
+            "ownership_to":        own_to,
+            "window_is_full_season": is_full,
+            # FDR + smart score
+            "fdr_in":              fdr_in,
+            "fdr_out":             fdr_out,
+            "smart_score":         smart_score,
+            # flags
+            "flag_in":             flag_in,
+            "flag_in_archived":    flag_in is not None,
+            "flag_out":            flag_out,
+            "flag_out_archived":   flag_out is not None,
+            # chart
+            "chart_gw_points":     chart_gw_points,
+        })
+
+    # ── Manager summary with hit_rate ────────────────────────────────────────
+    managers_dict: dict = {}
     for t in transfers:
         m = t["manager"]
-        if m not in managers:
-            managers[m] = {
+        if m not in managers_dict:
+            managers_dict[m] = {
                 "manager":        m,
-                "team_id":        t["team_id"],   # ft.id — correct key for managerMap
+                "team_id":        t["team_id"],
                 "total_moves":    0,
+                "positive_moves": 0,
                 "net_delta":      0,
+                "hit_rate":       0,
                 "best_transfer":  None,
                 "worst_transfer": None,
             }
-        managers[m]["total_moves"] += 1
-        managers[m]["net_delta"]   += t["delta"]
-        if managers[m]["best_transfer"] is None or \
-                t["delta"] > managers[m]["best_transfer"]["delta"]:
-            managers[m]["best_transfer"] = t
-        if managers[m]["worst_transfer"] is None or \
-                t["delta"] < managers[m]["worst_transfer"]["delta"]:
-            managers[m]["worst_transfer"] = t
+        managers_dict[m]["total_moves"]    += 1
+        managers_dict[m]["net_delta"]      += t["delta"]
+        if t["delta"] > 0:
+            managers_dict[m]["positive_moves"] += 1
+        if managers_dict[m]["best_transfer"]  is None or \
+                t["delta"] > managers_dict[m]["best_transfer"]["delta"]:
+            managers_dict[m]["best_transfer"] = t
+        if managers_dict[m]["worst_transfer"] is None or \
+                t["delta"] < managers_dict[m]["worst_transfer"]["delta"]:
+            managers_dict[m]["worst_transfer"] = t
+
+    for mgr in managers_dict.values():
+        mgr["hit_rate"] = round(
+            (mgr["positive_moves"] / mgr["total_moves"]) * 100
+        ) if mgr["total_moves"] else 0
+
+    manager_summary = list(managers_dict.values())
+
+    # ── Best / worst by pts/GW (the featured callout cards) ─────────────────
+    best_pgw  = max(transfers, key=lambda t: t["delta_per_gw"]) if transfers else None
+    worst_pgw = min(transfers, key=lambda t: t["delta_per_gw"]) if transfers else None
 
     return {
-        "all_transfers":   transfers,
-        "best_transfer":   transfers[0]  if transfers else None,
-        "worst_transfer":  transfers[-1] if transfers else None,
-        "manager_summary": list(managers.values()),
+        "all_transfers":       transfers,
+        "best_transfer":       max(transfers, key=lambda t: t["delta"]) if transfers else None,
+        "worst_transfer":      min(transfers, key=lambda t: t["delta"]) if transfers else None,
+        "best_transfer_pgw":   best_pgw,
+        "worst_transfer_pgw":  worst_pgw,
+        "manager_summary":     manager_summary,
     }
 
+
+@router.get("/season/{season_id}/transfer-stats")
+def get_transfer_stats(season_id: int):
+    """
+    Aggregated transfer statistics for the Analytics tab.
+    Returns: by_position, by_manager, by_gw, busiest_gw, regret_board,
+             by_gw_position, by_team, by_gw_team, team_strengths, all_fixtures.
+    """
+    _season_or_404(season_id)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # ── by_position ─────────────────────────────────────────────────
+            # count, hit_rate, avg_delta by position (player IN position)
+            cur.execute("""
+                WITH tx_data AS (
+                    SELECT
+                        et_in.singular_name_short AS position,
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            WHERE pgs.player_id = tx.player_in_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw
+                        ), 0) -
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            WHERE pgs.player_id = tx.player_out_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw
+                        ), 0) AS delta
+                    FROM transactions tx
+                    JOIN players p_in  ON p_in.id  = tx.player_in_id  AND p_in.season_id  = tx.season_id
+                    JOIN element_type et_in ON et_in.id = p_in.position
+                    WHERE tx.season_id = %s AND tx.result = 'a'
+                )
+                SELECT
+                    position,
+                    COUNT(*)                                            AS count,
+                    ROUND(AVG(delta)::numeric, 1)                      AS avg_delta,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE delta > 0)
+                          / NULLIF(COUNT(*), 0), 0)                    AS hit_rate,
+                    -- normalise by squad slots: GKP=2, DEF=5, MID=5, FWD=3
+                    ROUND(COUNT(*)::numeric / CASE position
+                        WHEN 'GKP' THEN 2 WHEN 'DEF' THEN 5
+                        WHEN 'MID' THEN 5 WHEN 'FWD' THEN 3 ELSE 1
+                    END, 2)                                             AS count_per_slot
+                FROM tx_data
+                GROUP BY position
+                ORDER BY count DESC;
+            """, (season_id,))
+            by_pos_rows = cur.fetchall()
+
+            # ── by_manager ──────────────────────────────────────────────────
+            cur.execute("""
+                WITH tx_data AS (
+                    SELECT
+                        ft.player_first_name AS manager,
+                        ft.id AS fpl_team_id,
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            WHERE pgs.player_id = tx.player_in_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw
+                        ), 0) -
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            WHERE pgs.player_id = tx.player_out_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw
+                        ), 0) AS delta
+                    FROM transactions tx
+                    JOIN fantasy_teams ft ON ft.id = tx.team_id AND ft.season_id = tx.season_id
+                    WHERE tx.season_id = %s AND tx.result = 'a'
+                )
+                SELECT
+                    manager,
+                    fpl_team_id,
+                    COUNT(*)                                             AS count,
+                    SUM(delta)                                           AS net_delta,
+                    COUNT(*) FILTER (WHERE delta > 0)                   AS positive_moves,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE delta > 0)
+                          / NULLIF(COUNT(*), 0), 0)                     AS hit_rate
+                FROM tx_data
+                GROUP BY manager, fpl_team_id
+                ORDER BY net_delta DESC;
+            """, (season_id,))
+            by_mgr_rows = cur.fetchall()
+
+            # ── by_gw ────────────────────────────────────────────────────────
+            cur.execute("""
+                SELECT tx.gw, COUNT(*) AS count
+                FROM transactions tx
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY tx.gw
+                ORDER BY tx.gw;
+            """, (season_id,))
+            by_gw_rows = cur.fetchall()
+
+            # ── by_gw_position ────────────────────────────────────────────────
+            cur.execute("""
+                SELECT tx.gw, et_in.singular_name_short AS position, COUNT(*) AS count
+                FROM transactions tx
+                JOIN players p_in ON p_in.id = tx.player_in_id AND p_in.season_id = tx.season_id
+                JOIN element_type et_in ON et_in.id = p_in.position
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY tx.gw, et_in.singular_name_short
+                ORDER BY tx.gw, et_in.id;
+            """, (season_id,))
+            by_gw_pos_rows = cur.fetchall()
+
+            # ── by_team ───────────────────────────────────────────────────────
+            # transfers IN and OUT per PL team, split by attack/defence
+            cur.execute("""
+                SELECT
+                    plt.short_name AS pl_team,
+                    SUM(CASE WHEN et.singular_name_short IN ('MID','FWD') THEN 1 ELSE 0 END) AS attack_in,
+                    SUM(CASE WHEN et.singular_name_short IN ('GKP','DEF') THEN 1 ELSE 0 END) AS defense_in
+                FROM transactions tx
+                JOIN players p ON p.id = tx.player_in_id AND p.season_id = tx.season_id
+                JOIN element_type et ON et.id = p.position
+                JOIN premier_league_teams plt ON plt.id = p.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY plt.short_name
+                ORDER BY (attack_in + defense_in) DESC
+                LIMIT 20;
+            """, (season_id,))
+            team_in_rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT
+                    plt.short_name AS pl_team,
+                    SUM(CASE WHEN et.singular_name_short IN ('MID','FWD') THEN 1 ELSE 0 END) AS attack_out,
+                    SUM(CASE WHEN et.singular_name_short IN ('GKP','DEF') THEN 1 ELSE 0 END) AS defense_out
+                FROM transactions tx
+                JOIN players p ON p.id = tx.player_out_id AND p.season_id = tx.season_id
+                JOIN element_type et ON et.id = p.position
+                JOIN premier_league_teams plt ON plt.id = p.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY plt.short_name
+                ORDER BY (attack_out + defense_out) DESC
+                LIMIT 20;
+            """, (season_id,))
+            team_out_rows = cur.fetchall()
+
+            # ── by_gw_team ────────────────────────────────────────────────────
+            cur.execute("""
+                SELECT tx.gw, plt.short_name AS pl_team, 'in' AS direction, COUNT(*) AS count
+                FROM transactions tx
+                JOIN players p ON p.id = tx.player_in_id AND p.season_id = tx.season_id
+                JOIN premier_league_teams plt ON plt.id = p.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY tx.gw, plt.short_name
+                UNION ALL
+                SELECT tx.gw, plt.short_name AS pl_team, 'out' AS direction, COUNT(*) AS count
+                FROM transactions tx
+                JOIN players p ON p.id = tx.player_out_id AND p.season_id = tx.season_id
+                JOIN premier_league_teams plt ON plt.id = p.team AND plt.season_id = tx.season_id
+                WHERE tx.season_id = %s AND tx.result = 'a'
+                GROUP BY tx.gw, plt.short_name
+                ORDER BY gw, pl_team;
+            """, (season_id, season_id))
+            by_gw_team_rows = cur.fetchall()
+
+            # ── regret_board ──────────────────────────────────────────────────
+            # transfers where dropped player outscored pickup — top 10
+            cur.execute("""
+                WITH regret AS (
+                    SELECT
+                        ft.player_first_name              AS manager,
+                        tx.gw,
+                        p_in.web_name                     AS player_in,
+                        et_in.singular_name_short         AS pos_in,
+                        p_out.web_name                    AS player_out,
+                        et_out.singular_name_short        AS pos_out,
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            WHERE pgs.player_id = tx.player_in_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw
+                        ), 0) AS pts_in,
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            WHERE pgs.player_id = tx.player_out_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw
+                        ), 0) AS pts_out
+                    FROM transactions tx
+                    JOIN fantasy_teams ft ON ft.id = tx.team_id AND ft.season_id = tx.season_id
+                    JOIN players p_in  ON p_in.id  = tx.player_in_id  AND p_in.season_id  = tx.season_id
+                    JOIN players p_out ON p_out.id = tx.player_out_id AND p_out.season_id = tx.season_id
+                    JOIN element_type et_in  ON et_in.id  = p_in.position
+                    JOIN element_type et_out ON et_out.id = p_out.position
+                    WHERE tx.season_id = %s AND tx.result = 'a'
+                )
+                SELECT manager, gw, player_in, pos_in, player_out, pos_out, pts_in, pts_out
+                FROM regret
+                WHERE pts_out > pts_in
+                ORDER BY (pts_out - pts_in) DESC
+                LIMIT 10;
+            """, (season_id,))
+            regret_rows = cur.fetchall()
+
+            # ── team strengths + all fixtures (for FDR in club-activity chart) ─
+            cur.execute("""
+                SELECT DISTINCT ON (team_id)
+                    team_id, name, short_name,
+                    strength_attack_home  AS atk_h,
+                    strength_attack_away  AS atk_a,
+                    strength_defence_home AS def_h,
+                    strength_defence_away AS def_a
+                FROM premier_league_teams
+                WHERE season_id = %s
+                ORDER BY team_id, position DESC;
+            """, (season_id,))
+            team_strength_rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT id, gw, team_h, team_a
+                FROM fixtures
+                WHERE season_id = %s
+                ORDER BY gw;
+            """, (season_id,))
+            all_fixture_rows = cur.fetchall()
+
+    # ── Assemble by_team ──────────────────────────────────────────────────────
+    team_in_map  = {r[0]: {"attack": int(r[1]), "defense": int(r[2])} for r in team_in_rows}
+    team_out_map = {r[0]: {"attack": int(r[1]), "defense": int(r[2])} for r in team_out_rows}
+    all_teams = sorted(set(list(team_in_map.keys()) + list(team_out_map.keys())))
+    by_team = [
+        {
+            "pl_team": t,
+            "in":  team_in_map.get(t,  {"attack": 0, "defense": 0}),
+            "out": team_out_map.get(t, {"attack": 0, "defense": 0}),
+        }
+        for t in all_teams
+    ]
+    by_team.sort(key=lambda x: x["in"]["attack"] + x["in"]["defense"], reverse=True)
+
+    # ── Busiest GW ───────────────────────────────────────────────────────────
+    busiest = max(by_gw_rows, key=lambda r: r[1]) if by_gw_rows else None
+
+    return {
+        "by_position": [
+            {
+                "position":      r[0],
+                "count":         int(r[1]),
+                "avg_delta":     float(r[2]) if r[2] else 0,
+                "hit_rate":      int(r[3])   if r[3] else 0,
+                "count_per_slot": float(r[4]) if r[4] else 0,
+            }
+            for r in by_pos_rows
+        ],
+        "by_manager": [
+            {
+                "manager":        r[0],
+                "team_id":        r[1],
+                "count":          int(r[2]),
+                "net_delta":      int(r[3]),
+                "positive_moves": int(r[4]),
+                "hit_rate":       int(r[5]) if r[5] else 0,
+            }
+            for r in by_mgr_rows
+        ],
+        "by_gw": [
+            {"gw": r[0], "count": int(r[1])}
+            for r in by_gw_rows
+        ],
+        "by_gw_position": [
+            {"gw": r[0], "position": r[1], "count": int(r[2])}
+            for r in by_gw_pos_rows
+        ],
+        "by_team": by_team,
+        "by_gw_team": [
+            {"gw": r[0], "pl_team": r[1], "direction": r[2], "count": int(r[3])}
+            for r in by_gw_team_rows
+        ],
+        "busiest_gw": {"gw": busiest[0], "count": int(busiest[1])} if busiest else None,
+        "regret_board": [
+            {
+                "manager":    r[0],
+                "gw":         r[1],
+                "player_in":  r[2],
+                "pos_in":     r[3],
+                "player_out": r[4],
+                "pos_out":    r[5],
+                "pts_in":     int(r[6]),
+                "pts_out":    int(r[7]),
+            }
+            for r in regret_rows
+        ],
+        "team_strengths": [
+            {
+                "id":         r[0],
+                "name":       r[1],
+                "short_name": r[2],
+                "atk_h": r[3], "atk_a": r[4],
+                "def_h": r[5], "def_a": r[6],
+            }
+            for r in team_strength_rows
+        ],
+        "all_fixtures": [
+            {"id": r[0], "gw": r[1], "team_h": r[2], "team_a": r[3]}
+            for r in all_fixture_rows
+        ],
+    }
 
 # ---------------------------------------------------------------------------
 # Fixtures upcoming — FDR from team_strength_history (no live API call)
