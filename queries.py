@@ -1495,31 +1495,76 @@ def get_transfer_stats(season_id: int):
             """, (season_id, season_id))
             gw_team_rows = cur.fetchall()
 
-            # Regret board (full season delta, worst 10)
+            # Regret + value boards — ownership-window normalised (pts/GW held)
             cur.execute("""
+                WITH windows AS (
+                    SELECT
+                        tx.id                                    AS tx_id,
+                        ft.player_first_name                     AS manager,
+                        tx.gw,
+                        p_in.web_name                            AS player_in,
+                        et_in.singular_name_short                AS pos_in,
+                        p_out.web_name                           AS player_out,
+                        et_out.singular_name_short               AS pos_out,
+                        COALESCE(
+                            (SELECT poh.from_gw FROM player_ownership_history poh
+                             WHERE poh.player_id = tx.player_in_id
+                               AND poh.team_id   = tx.team_id
+                               AND poh.season_id = tx.season_id
+                               AND poh.from_gw  >= tx.gw
+                             ORDER BY poh.from_gw LIMIT 1),
+                            tx.gw + 1
+                        ) AS win_from,
+                        COALESCE(
+                            (SELECT poh.to_gw FROM player_ownership_history poh
+                             WHERE poh.player_id = tx.player_in_id
+                               AND poh.team_id   = tx.team_id
+                               AND poh.season_id = tx.season_id
+                               AND poh.from_gw  >= tx.gw
+                             ORDER BY poh.from_gw LIMIT 1),
+                            (SELECT COALESCE(MAX(gw), 38) FROM player_gameweek_stats
+                             WHERE season_id = tx.season_id)
+                        ) AS win_to
+                    FROM transactions tx
+                    JOIN fantasy_teams ft ON ft.id = tx.team_id AND ft.season_id = tx.season_id
+                    JOIN players p_in  ON p_in.id  = tx.player_in_id  AND p_in.season_id  = tx.season_id
+                    JOIN players p_out ON p_out.id = tx.player_out_id AND p_out.season_id = tx.season_id
+                    JOIN element_type et_in  ON et_in.id  = p_in.position
+                    JOIN element_type et_out ON et_out.id = p_out.position
+                    WHERE tx.season_id = %s AND tx.result = 'a'
+                ),
+                scored AS (
+                    SELECT
+                        w.manager, w.gw, w.player_in, w.pos_in, w.player_out, w.pos_out,
+                        GREATEST(w.win_to - w.win_from + 1, 1) AS gws_held,
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            JOIN transactions tx2 ON tx2.id = w.tx_id
+                            WHERE pgs.player_id = tx2.player_in_id
+                              AND pgs.season_id = %s
+                              AND pgs.gw BETWEEN w.win_from AND w.win_to
+                        ), 0) AS pts_in_window,
+                        COALESCE((
+                            SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                            JOIN transactions tx2 ON tx2.id = w.tx_id
+                            WHERE pgs.player_id = tx2.player_out_id
+                              AND pgs.season_id = %s
+                              AND pgs.gw BETWEEN w.win_from AND w.win_to
+                        ), 0) AS pts_out_window
+                    FROM windows w
+                )
                 SELECT
-                    ft.player_first_name AS manager, tx.gw,
-                    p_in.web_name AS player_in, et_in.singular_name_short AS pos_in,
-                    p_out.web_name AS player_out, et_out.singular_name_short AS pos_out,
-                    COALESCE((SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
-                        WHERE pgs.player_id = tx.player_in_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw), 0) AS pts_in,
-                    COALESCE((SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
-                        WHERE pgs.player_id = tx.player_out_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw), 0) AS pts_out
-                FROM transactions tx
-                JOIN fantasy_teams ft ON ft.id = tx.team_id AND ft.season_id = tx.season_id
-                JOIN players p_in  ON p_in.id  = tx.player_in_id  AND p_in.season_id  = tx.season_id
-                JOIN players p_out ON p_out.id = tx.player_out_id AND p_out.season_id = tx.season_id
-                JOIN element_type et_in  ON et_in.id  = p_in.position
-                JOIN element_type et_out ON et_out.id = p_out.position
-                WHERE tx.season_id = %s AND tx.result = 'a'
-                ORDER BY (
-                    COALESCE((SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
-                        WHERE pgs.player_id = tx.player_in_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw), 0)
-                    - COALESCE((SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
-                        WHERE pgs.player_id = tx.player_out_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw), 0)
-                ) ASC LIMIT 10;
-            """, (season_id,))
-            regret_rows = cur.fetchall()
+                    manager, gw, player_in, pos_in, player_out, pos_out,
+                    gws_held,
+                    (pts_in_window - pts_out_window) AS delta_window,
+                    ROUND((pts_in_window - pts_out_window)::numeric
+                          / GREATEST(gws_held, 1), 2) AS delta_per_gw
+                FROM scored
+                ORDER BY delta_per_gw ASC;
+            """, (season_id, season_id, season_id))
+            all_board_rows = cur.fetchall()
+            regret_rows = all_board_rows[:10]
+            value_rows  = list(reversed(all_board_rows))[:10]
 
             # Team strengths + all fixtures (for frontend FDR colouring)
             cur.execute("""
@@ -1586,10 +1631,25 @@ def get_transfer_stats(season_id: int):
         "busiest_gw":   busiest,
         "regret_board": [
             {
-                "manager": r[0], "gw": r[1], "player_in": r[2], "pos_in": r[3],
-                "player_out": r[4], "pos_out": r[5], "pts_in": int(r[6]), "pts_out": int(r[7]),
+                "manager":      r[0], "gw":          r[1],
+                "player_in":    r[2], "pos_in":       r[3],
+                "player_out":   r[4], "pos_out":      r[5],
+                "gws_held":     int(r[6]),
+                "delta_window": int(r[7]),
+                "delta_per_gw": float(r[8]),
             }
             for r in regret_rows
+        ],
+        "value_board": [
+            {
+                "manager":      r[0], "gw":          r[1],
+                "player_in":    r[2], "pos_in":       r[3],
+                "player_out":   r[4], "pos_out":      r[5],
+                "gws_held":     int(r[6]),
+                "delta_window": int(r[7]),
+                "delta_per_gw": float(r[8]),
+            }
+            for r in value_rows
         ],
         "by_gw_position": [{"gw": r[0], "position": r[1], "count": int(r[2])} for r in gw_pos_rows],
         "by_gw_team":     [{"gw": r[0], "pl_team": r[1], "direction": r[2], "count": int(r[3])} for r in gw_team_rows],
