@@ -938,6 +938,12 @@ def get_player_stats(season_id: int):
 # Transfer analytics
 # ---------------------------------------------------------------------------
 
+# ── REPLACEMENT for get_transfer_analytics() in queries.py ──
+# Two changes from the previous version:
+#   1. CTE now selects ft.id AS fpl_team_id (added after manager name)
+#   2. Row indices shifted by 1 from r[2] onward; team_id now uses fpl_team_id (ft.id)
+#      so it matches the managerMap keys built from the summary endpoint
+
 @router.get("/season/{season_id}/transfers")
 def get_transfer_analytics(season_id: int):
     """
@@ -953,6 +959,7 @@ def get_transfer_analytics(season_id: int):
                     SELECT
                         tx.id,
                         ft.player_first_name AS manager,
+                        ft.id                AS fpl_team_id,
                         ft.internal_team_id,
                         tx.gw,
                         tx.kind,
@@ -994,21 +1001,24 @@ def get_transfer_analytics(season_id: int):
             """, (season_id,))
             rows = cur.fetchall()
 
+    # Column order: id, manager, fpl_team_id, internal_team_id, gw, kind, result,
+    #               player_in, player_out, player_in_id, player_out_id,
+    #               points_in_after, points_out_after, delta
     transfers = [
         {
             "id":               r[0],
             "manager":          r[1],
-            "team_id":          r[2],
-            "gw":               r[3],
-            "kind":             r[4],
-            "result":           r[5],
-            "player_in":        r[6],
-            "player_out":       r[7],
-            "player_in_id":     r[8],
-            "player_out_id":    r[9],
-            "points_in_after":  r[10],
-            "points_out_after": r[11],
-            "delta":            r[12],
+            "team_id":          r[2],   # ft.id — matches managerMap keys from summary
+            "gw":               r[4],
+            "kind":             r[5],
+            "result":           r[6],
+            "player_in":        r[7],
+            "player_out":       r[8],
+            "player_in_id":     r[9],
+            "player_out_id":    r[10],
+            "points_in_after":  r[11],
+            "points_out_after": r[12],
+            "delta":            r[13],
         }
         for r in rows
     ]
@@ -1019,7 +1029,7 @@ def get_transfer_analytics(season_id: int):
         if m not in managers:
             managers[m] = {
                 "manager":        m,
-                "team_id":        t["team_id"],
+                "team_id":        t["team_id"],   # ft.id — correct key for managerMap
                 "total_moves":    0,
                 "net_delta":      0,
                 "best_transfer":  None,
