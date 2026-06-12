@@ -1512,7 +1512,12 @@ def get_transfer_stats(season_id: int):
                 JOIN element_type et_in  ON et_in.id  = p_in.position
                 JOIN element_type et_out ON et_out.id = p_out.position
                 WHERE tx.season_id = %s AND tx.result = 'a'
-                ORDER BY (pts_in - pts_out) ASC LIMIT 10;
+                ORDER BY (
+                    COALESCE((SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                        WHERE pgs.player_id = tx.player_in_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw), 0)
+                    - COALESCE((SELECT SUM(pgs.total_points) FROM player_gameweek_stats pgs
+                        WHERE pgs.player_id = tx.player_out_id AND pgs.season_id = tx.season_id AND pgs.gw > tx.gw), 0)
+                ) ASC LIMIT 10;
             """, (season_id,))
             regret_rows = cur.fetchall()
 
